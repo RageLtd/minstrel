@@ -1,0 +1,90 @@
+:root {
+  color-scheme: dark;
+  --bg: #14161a;
+  --panel: #1d2026;
+  --fg: #e7e9ee;
+  --muted: #9aa1ad;
+  --accent: #c2703f;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--fg);
+  font: 16px/1.5 system-ui, sans-serif;
+}
+
+.app {
+  max-width: 44rem;
+  margin: 0 auto;
+  padding: 2rem 1.25rem;
+}
+
+h1 {
+  font-weight: 600;
+  letter-spacing: 0.02em;
+}
+
+.composer {
+  display: flex;
+  gap: 0.5rem;
+}
+
+.composer input {
+  flex: 1;
+  padding: 0.6rem 0.8rem;
+  border: 1px solid #333842;
+  border-radius: 8px;
+  background: var(--panel);
+  color: var(--fg);
+}
+
+button {
+  padding: 0.6rem 1rem;
+  border: 0;
+  border-radius: 8px;
+  background: var(--accent);
+  color: #1a1207;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+.error {
+  color: #e06c6c;
+}
+
+.reply {
+  color: var(--muted);
+}
+
+.tracks {
+  list-style: none;
+  padding: 0;
+  display: grid;
+  gap: 0.25rem;
+}
+
+.tracks li {
+  display: flex;
+  justify-content: space-between;
+  padding: 0.5rem 0.7rem;
+  background: var(--panel);
+  border-radius: 6px;
+}
+
+.tracks .artist {
+  color: var(--muted);
+}
+
+.saved {
+  color: #6cc28a;
+}
