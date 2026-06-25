@@ -1,0 +1,86 @@
+from __future__ import annotations
+
+import os
+
+import numpy as np
+import torch
+import transformers
+from transformers import (
+    ClapAudioModelWithProjection,
+    ClapProcessor,
+    ClapTextModelWithProjection,
+)
+
+from .device import select_device
+
+# Loading the full checkpoint into each single-tower projection head reports the
+# other tower's weights as "unexpected" — harmless, so silence it.
+transformers.logging.set_verbosity_error()
+
+# CLAP expects 48 kHz mono audio.
+CLAP_SR = 48_000
+EMBED_DIM = 512
+
+# Music-tuned LAION checkpoint; matches the Xenova ONNX build we'd use if the
+# worker ever moves to TypeScript, so embeddings stay comparable across both.
+DEFAULT_MODEL = os.environ.get(
+    "MINSTREL_CLAP_MODEL", "laion/larger_clap_music_and_speech"
+)
+
+
+def _l2(t: torch.Tensor) -> torch.Tensor:
+    return t / t.norm(dim=-1, keepdim=True).clamp_min(1e-12)
+
+
+class Clap:
+    """Produces L2-normalised embeddings in CLAP's shared audio/text space.
+
+    The audio and text projection heads map into one contrastive space, so a
+    text query embedding is directly comparable to a track's audio embedding.
+    """
+
+    def __init__(self, model_name: str = DEFAULT_MODEL) -> None:
+        self.device = select_device()
+        self.audio_model = (
+            ClapAudioModelWithProjection.from_pretrained(model_name)
+            .to(self.device)
+            .eval()
+        )
+        self.text_model = (
+            ClapTextModelWithProjection.from_pretrained(model_name)
+            .to(self.device)
+            .eval()
+        )
+        self.processor = ClapProcessor.from_pretrained(model_name)
+
+    @torch.no_grad()
+    def embed_audio(self, audio: np.ndarray) -> np.ndarray:
+        """L2-normalised 512-dim embedding for one mono 48 kHz waveform."""
+        inputs = self.processor(
+            audio=audio, sampling_rate=CLAP_SR, return_tensors="pt"
+        )
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        feats = _l2(self.audio_model(**inputs).audio_embeds)
+        return feats[0].cpu().numpy().astype(np.float32)
+
+    @torch.no_grad()
+    def embed_text(self, texts: list[str]) -> np.ndarray:
+        """L2-normalised [n, 512] embeddings for text prompts."""
+        inputs = self.processor(text=texts, return_tensors="pt", padding=True)
+        inputs = {k: v.to(self.device) for k, v in inputs.items()}
+        feats = _l2(self.text_model(**inputs).text_embeds)
+        return feats.cpu().numpy().astype(np.float32)
+
+    def zero_shot_pair(
+        self, audio_embed: np.ndarray, positive: str, negative: str
+    ) -> float:
+        """Calibrated 0..1 score via a contrastive prompt pair.
+
+        Softmax over (sim_to_positive, sim_to_negative) gives a probability that
+        the track matches `positive` — e.g. "aggressive heavy music" vs
+        "calm gentle music" yields an aggressiveness score.
+        """
+        txt = self.embed_text([positive, negative])  # [2, 512], normalised
+        sims = txt @ audio_embed  # audio_embed already normalised
+        e = np.exp(sims - sims.max())
+        return float((e / e.sum())[0])
