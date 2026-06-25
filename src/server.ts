@@ -1,4 +1,4 @@
-import index from "./app.html";
+import index from "../app.html";
 import { openDb } from "./db";
 import { makeEmbedder } from "./embedder";
 import { makeNavidrome } from "./navidrome";
@@ -46,7 +46,10 @@ const server = Bun.serve({
       },
     },
   },
-  development: { hmr: true, console: true },
+  development:
+    process.env.NODE_ENV === "production"
+      ? false
+      : { hmr: true, console: true },
 });
 
 console.log(`Minstrel listening on http://localhost:${server.port}`);

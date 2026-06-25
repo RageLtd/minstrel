@@ -1,0 +1,117 @@
+name: minstrel
+
+# Five services on one Docker host (the DGX Spark). The three CUDA services
+# reserve the GPU via the NVIDIA Container Toolkit. The analyzer is a batch job,
+# not a daemon — it lives behind the `ingest` profile (see the note on it).
+
+services:
+  navidrome:
+    image: deluan/navidrome:latest
+    restart: unless-stopped
+    ports:
+      - "${NAVIDROME_PORT:-4533}:4533"
+    environment:
+      ND_MUSICFOLDER: /music
+      ND_DATAFOLDER: /data
+      # inotify does not fire over NFS, so poll instead of watching.
+      ND_SCANSCHEDULE: "@every 1h"
+    volumes:
+      - ${MUSIC_PATH:-/mnt/music}:/music:ro
+      - navidrome-data:/data
+
+  embed-server:
+    build:
+      context: .
+      dockerfile: analyzer/Dockerfile
+    image: minstrel-analyzer
+    restart: unless-stopped
+    command: ["python", "-m", "minstrel_analyzer.embed_server"]
+    environment:
+      MINSTREL_EMBED_HOST: 0.0.0.0
+      MINSTREL_EMBED_PORT: "8001"
+      HF_HOME: /hf-cache
+    volumes:
+      - hf-cache:/hf-cache
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - import urllib.request; urllib.request.urlopen('http://localhost:8001/healthz')
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 300s # first boot downloads the CLAP checkpoint
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: Dockerfile.orchestrator
+    image: minstrel-orchestrator
+    restart: unless-stopped
+    ports:
+      - "${ORCHESTRATOR_PORT:-3000}:3000"
+    environment:
+      NODE_ENV: production
+      PORT: "3000"
+      MINSTREL_DB: /data/minstrel.db
+      MINSTREL_EMBED_URL: http://embed-server:8001
+      # Your existing Ollama. Default reaches a server on the Docker host; set a
+      # LAN address in .env if it lives elsewhere.
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
+      MINSTREL_MODEL: ${MINSTREL_MODEL:-qwen3.5:35b-a3b}
+      NAVIDROME_URL: http://navidrome:4533
+      NAVIDROME_USER: ${NAVIDROME_USER:?set NAVIDROME_USER in .env}
+      NAVIDROME_PASS: ${NAVIDROME_PASS:?set NAVIDROME_PASS in .env}
+    volumes:
+      - minstrel-db:/data # WAL readers need write access to the dir, so not :ro
+    # Lets OLLAMA_URL's default reach a server running on the Docker host (Linux).
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    depends_on:
+      navidrome:
+        condition: service_started
+      embed-server:
+        condition: service_healthy
+
+  # Batch ingest — NOT started by `docker compose up`. Run on demand or from a
+  # host cron once Navidrome has scanned the library:
+  #   docker compose run --rm analyzer
+  analyzer:
+    build:
+      context: .
+      dockerfile: analyzer/Dockerfile
+    image: minstrel-analyzer
+    profiles: ["ingest"]
+    command: ["python", "-m", "minstrel_analyzer.analyze"]
+    environment:
+      MINSTREL_DB: /data/minstrel.db
+      HF_HOME: /hf-cache
+      NAVIDROME_URL: http://navidrome:4533
+      NAVIDROME_USER: ${NAVIDROME_USER:?set NAVIDROME_USER in .env}
+      NAVIDROME_PASS: ${NAVIDROME_PASS:?set NAVIDROME_PASS in .env}
+    volumes:
+      - minstrel-db:/data
+      - hf-cache:/hf-cache
+    depends_on:
+      navidrome:
+        condition: service_started
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+volumes:
+  navidrome-data:
+  minstrel-db:
+  hf-cache:
