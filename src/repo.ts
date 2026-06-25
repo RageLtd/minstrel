@@ -148,3 +148,17 @@ export function searchTracks(
 
   return db.query(sql).all(query, fetchK, ...filterParams, k) as SearchHit[];
 }
+
+/** All stored embeddings for tracks by a given artist (case-insensitive). */
+export function artistEmbeddings(db: Database, artist: string): Float32Array[] {
+  const rows = db
+    .query(
+      `SELECT v.embedding AS e
+         FROM track_vec v
+         JOIN tracks t ON t.id = v.track_id
+        WHERE t.artist = ? COLLATE NOCASE`,
+    )
+    .all(artist) as { e: Uint8Array }[];
+  // slice() copies into a fresh, 4-byte-aligned buffer at offset 0.
+  return rows.map((r) => new Float32Array(r.e.slice().buffer));
+}
