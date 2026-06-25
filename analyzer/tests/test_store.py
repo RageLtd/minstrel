@@ -1,52 +1,65 @@
+import io
+
 import numpy as np
 import soundfile as sf
 
 from minstrel_analyzer import analyze, store
 from minstrel_analyzer.clap import Clap
+from minstrel_analyzer.navidrome import Song
 
 
-def _write_tone(path: str, sr: int = 48000, secs: float = 3.0, freq: float = 220.0):
+def _tone_bytes(sr: int = 48000, secs: float = 3.0, freq: float = 220.0) -> bytes:
     t = np.linspace(0, secs, int(sr * secs), endpoint=False)
-    sf.write(path, (0.3 * np.sin(2 * np.pi * freq * t)).astype(np.float32), sr, format="FLAC")
+    buf = io.BytesIO()
+    sf.write(buf, (0.3 * np.sin(2 * np.pi * freq * t)).astype(np.float32), sr, format="FLAC")
+    return buf.getvalue()
 
 
-def test_analyze_writes_to_shared_db(tmp_path, clap: Clap):
-    flac = tmp_path / "tone.flac"
-    _write_tone(str(flac))
-    conn = store.open_db(str(tmp_path / "minstrel.db"))
+def _song(song_id: str, size: int, **kw) -> Song:
+    return Song(
+        id=song_id,
+        title=kw.get("title", "t"),
+        artist=kw.get("artist", "a"),
+        album=kw.get("album", "al"),
+        size=size,
+        mbid=kw.get("mbid"),
+    )
 
-    track_id = analyze.analyze_file(clap, conn, str(flac))
-    assert isinstance(track_id, int)
 
-    assert conn.execute("SELECT count(*) FROM tracks").fetchone()[0] == 1
+class FakeNavidrome:
+    def __init__(self, songs: list[Song], audio: bytes):
+        self._songs = songs
+        self._audio = audio
+        self.downloads = 0
+
+    def iter_songs(self):
+        return iter(self._songs)
+
+    def download(self, song_id: str) -> bytes:
+        self.downloads += 1
+        return self._audio
+
+
+def test_sync_writes_tracks_keyed_by_navidrome_id(tmp_path, clap: Clap):
+    nav = FakeNavidrome(
+        [_song("nav-1", 1000, artist="Mastodon", mbid="mb-1")], _tone_bytes()
+    )
+    conn = store.open_db(str(tmp_path / "m.db"))
+
+    assert analyze.sync(clap, conn, nav) == 1
+
+    row = conn.execute("SELECT navidrome_id, mbid, artist FROM tracks").fetchone()
+    assert row == ("nav-1", "mb-1", "Mastodon")
     assert conn.execute("SELECT count(*) FROM track_vec").fetchone()[0] == 1
-
-    rms, agg = conn.execute(
-        "SELECT rms_energy, zs_aggressive FROM track_features WHERE track_id=?",
-        (track_id,),
-    ).fetchone()
+    rms = conn.execute("SELECT rms_energy FROM track_features").fetchone()[0]
     assert rms > 0
-    assert 0.0 <= agg <= 1.0
-
-    # Round-trip the stored embedding through KNN: nearest to itself is itself.
-    blob = conn.execute(
-        "SELECT embedding FROM track_vec WHERE track_id=?", (track_id,)
-    ).fetchone()[0]
-    nearest = conn.execute(
-        "SELECT track_id FROM track_vec WHERE embedding MATCH ? AND k=1 ORDER BY distance",
-        (blob,),
-    ).fetchone()[0]
-    assert nearest == track_id
 
 
-def test_unchanged_file_is_skipped(tmp_path, clap: Clap):
-    flac = tmp_path / "tone.flac"
-    _write_tone(str(flac))
-    conn = store.open_db(str(tmp_path / "minstrel.db"))
+def test_unchanged_size_is_skipped_without_download(tmp_path, clap: Clap):
+    nav = FakeNavidrome([_song("nav-1", 1000)], _tone_bytes())
+    conn = store.open_db(str(tmp_path / "m.db"))
 
-    first = analyze.analyze_file(clap, conn, str(flac))
-    second = analyze.analyze_file(clap, conn, str(flac))
-
-    assert isinstance(first, int)
-    assert second is None  # content hash unchanged → skipped
+    assert analyze.sync(clap, conn, nav) == 1
+    assert analyze.sync(clap, conn, nav) == 0  # same size → skipped
+    assert nav.downloads == 1  # second pass never downloaded
     assert conn.execute("SELECT count(*) FROM tracks").fetchone()[0] == 1

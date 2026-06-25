@@ -4,13 +4,12 @@ import type { Database } from "bun:sqlite";
 // embedding upsert, and the filtered similarity search the LLM tool drives.
 
 export interface TrackInput {
-  mbid: string | null;
-  filePath: string;
-  contentHash: string;
-  fileMtime: number;
+  navidromeId: string;
+  mbid?: string | null;
   title?: string;
   artist?: string;
   album?: string;
+  navSize?: number | null;
 }
 
 export interface Features {
@@ -34,6 +33,7 @@ export interface SearchFilters {
 
 export interface SearchHit {
   id: number;
+  navidromeId: string;
   title: string | null;
   artist: string | null;
   album: string | null;
@@ -44,26 +44,24 @@ export interface SearchHit {
 export function upsertTrack(db: Database, t: TrackInput): number {
   const row = db
     .query(
-      `INSERT INTO tracks (mbid, file_path, content_hash, file_mtime, title, artist, album, analyzed_at)
-       VALUES ($mbid, $path, $hash, $mtime, $title, $artist, $album, unixepoch())
-       ON CONFLICT(file_path) DO UPDATE SET
+      `INSERT INTO tracks (navidrome_id, mbid, title, artist, album, nav_size, analyzed_at)
+       VALUES ($nid, $mbid, $title, $artist, $album, $size, unixepoch())
+       ON CONFLICT(navidrome_id) DO UPDATE SET
          mbid = excluded.mbid,
-         content_hash = excluded.content_hash,
-         file_mtime = excluded.file_mtime,
          title = excluded.title,
          artist = excluded.artist,
          album = excluded.album,
+         nav_size = excluded.nav_size,
          analyzed_at = unixepoch()
        RETURNING id`,
     )
     .get({
-      $mbid: t.mbid,
-      $path: t.filePath,
-      $hash: t.contentHash,
-      $mtime: t.fileMtime,
+      $nid: t.navidromeId,
+      $mbid: t.mbid ?? null,
       $title: t.title ?? null,
       $artist: t.artist ?? null,
       $album: t.album ?? null,
+      $size: t.navSize ?? null,
     }) as { id: number };
   return row.id;
 }
@@ -137,7 +135,7 @@ export function searchTracks(
 
   const fetchK = Math.min(k * overfetch, 2000);
   const sql = `
-    SELECT t.id, t.title, t.artist, t.album, v.distance
+    SELECT t.id, t.navidrome_id AS navidromeId, t.title, t.artist, t.album, v.distance
       FROM track_vec v
       JOIN tracks t ON t.id = v.track_id
       JOIN track_features f ON f.track_id = v.track_id

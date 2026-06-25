@@ -10,7 +10,6 @@ dependencies = [
     "soundfile>=0.12",
     "numpy>=1.26",
     "sqlite-vec>=0.1.6",
-    "mutagen>=1.48.0",
 ]
 
 # Worker, not a distributable package — skip the build backend.

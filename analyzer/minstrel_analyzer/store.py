@@ -28,9 +28,13 @@ def open_db(path: str) -> sqlite3.Connection:
     return conn
 
 
-def existing_hash(conn: sqlite3.Connection, file_path: str) -> str | None:
+def existing_size(conn: sqlite3.Connection, navidrome_id: str) -> int | None:
+    """Last-analyzed Navidrome size for a song, or None if unseen.
+
+    A changed size means the file was replaced/re-encoded → re-analyze.
+    """
     row = conn.execute(
-        "SELECT content_hash FROM tracks WHERE file_path = ?", (file_path,)
+        "SELECT nav_size FROM tracks WHERE navidrome_id = ?", (navidrome_id,)
     ).fetchone()
     return row[0] if row else None
 
@@ -38,26 +42,24 @@ def existing_hash(conn: sqlite3.Connection, file_path: str) -> str | None:
 def upsert_track(
     conn: sqlite3.Connection,
     *,
-    mbid: str | None,
-    file_path: str,
-    content_hash: str,
-    file_mtime: int,
+    navidrome_id: str,
+    mbid: str | None = None,
     title: str | None = None,
     artist: str | None = None,
     album: str | None = None,
+    nav_size: int | None = None,
 ) -> int:
     row = conn.execute(
         """
         INSERT INTO tracks
-          (mbid, file_path, content_hash, file_mtime, title, artist, album, analyzed_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, unixepoch())
-        ON CONFLICT(file_path) DO UPDATE SET
-          mbid=excluded.mbid, content_hash=excluded.content_hash,
-          file_mtime=excluded.file_mtime, title=excluded.title,
-          artist=excluded.artist, album=excluded.album, analyzed_at=unixepoch()
+          (navidrome_id, mbid, title, artist, album, nav_size, analyzed_at)
+        VALUES (?, ?, ?, ?, ?, ?, unixepoch())
+        ON CONFLICT(navidrome_id) DO UPDATE SET
+          mbid=excluded.mbid, title=excluded.title, artist=excluded.artist,
+          album=excluded.album, nav_size=excluded.nav_size, analyzed_at=unixepoch()
         RETURNING id
         """,
-        (mbid, file_path, content_hash, file_mtime, title, artist, album),
+        (navidrome_id, mbid, title, artist, album, nav_size),
     ).fetchone()
     return int(row[0])
 

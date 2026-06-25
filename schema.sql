@@ -4,14 +4,12 @@
 
 CREATE TABLE IF NOT EXISTS tracks (
   id           INTEGER PRIMARY KEY,
-  mbid         TEXT UNIQUE,
-  file_path    TEXT NOT NULL UNIQUE,
-  content_hash TEXT NOT NULL,
-  file_mtime   INTEGER NOT NULL,
-  navidrome_id TEXT,
+  navidrome_id TEXT NOT NULL UNIQUE,  -- stable Navidrome PID; the join key everywhere
+  mbid         TEXT,                  -- secondary anchor for re-linking if PIDs rotate
   title        TEXT,
   artist       TEXT,
   album        TEXT,
+  nav_size     INTEGER,               -- Navidrome-reported size; incremental change signal
   analyzed_at  INTEGER
 );
 

@@ -17,10 +17,7 @@ function seed(
   emb: Float32Array,
 ): number {
   const id = upsertTrack(db, {
-    mbid: null,
-    filePath: path,
-    contentHash: "h",
-    fileMtime: 0,
+    navidromeId: path,
     title: path,
     artist,
   });

@@ -20,6 +20,7 @@ export interface OllamaMessage {
   content: string;
   thinking?: string;
   tool_calls?: OllamaToolCall[];
+  tool_name?: string; // set on role:"tool" messages carrying a tool result
 }
 
 export interface OllamaChatResponse {

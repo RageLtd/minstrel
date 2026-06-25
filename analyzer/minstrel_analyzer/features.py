@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 from typing import TypedDict
 
 import librosa
@@ -14,9 +15,13 @@ class Scalars(TypedDict):
     spectral_centroid: float
 
 
-def load_audio(path: str, sr: int = CLAP_SR) -> np.ndarray:
-    """Decode to mono at the target rate. soundfile handles FLAC natively."""
-    y, _ = librosa.load(path, sr=sr, mono=True)
+def load_audio_bytes(data: bytes, sr: int = CLAP_SR) -> np.ndarray:
+    """Decode in-memory audio bytes to mono at the target rate, then discard.
+
+    The original download from Navidrome is read straight from a buffer and never
+    written to disk.
+    """
+    y, _ = librosa.load(io.BytesIO(data), sr=sr, mono=True)
     return y.astype(np.float32)
 
 

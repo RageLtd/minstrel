@@ -456,7 +456,6 @@ version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
     { name = "librosa" },
-    { name = "mutagen" },
     { name = "numpy" },
     { name = "soundfile" },
     { name = "sqlite-vec" },
@@ -472,7 +471,6 @@ dev = [
 [package.metadata]
 requires-dist = [
     { name = "librosa", specifier = ">=0.10" },
-    { name = "mutagen", specifier = ">=1.48.0" },
     { name = "numpy", specifier = ">=1.26" },
     { name = "soundfile", specifier = ">=0.12" },
     { name = "sqlite-vec", specifier = ">=0.1.6" },
@@ -520,15 +518,6 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/2e/b9/8377a5ad8953fc0437c70cc98d9ae29f27fe5ac5109fbec0812085865735/msgpack-1.2.1-cp312-cp312-win32.whl", hash = "sha256:0c0d9802354507bcba62af19c17918e3eb437cc25e6f50657d511b5856a77aac", size = 64504, upload-time = "2026-06-18T16:13:08.822Z" },
     { url = "https://files.pythonhosted.org/packages/57/7f/ce1e377df7e62461fefd9eb23bfb93a4a523f40a517b377b8f844d836828/msgpack-1.2.1-cp312-cp312-win_amd64.whl", hash = "sha256:5c24aa15d5963051e1a5c62b12c50cd705992502b5ec1f3bece6046f33c9fc24", size = 71421, upload-time = "2026-06-18T16:13:09.828Z" },
     { url = "https://files.pythonhosted.org/packages/8f/32/ebfe84c9929f08f188d56c7a2fd913406a9ddad76a634697c1c43b8112e6/msgpack-1.2.1-cp312-cp312-win_arm64.whl", hash = "sha256:4227224aaec8f7fbcbfbd4272319347b2bb4030366502600f8c45588c5187b07", size = 64775, upload-time = "2026-06-18T16:13:11.056Z" },
-]
-
-[[package]]
-name = "mutagen"
-version = "1.48.0"
-source = { registry = "https://pypi.org/simple" }
-sdist = { url = "https://files.pythonhosted.org/packages/eb/2e/3e1b17cc655e59faac1008cfdaae2e38f123b9b229f0d1695f9860500d4d/mutagen-1.48.0.tar.gz", hash = "sha256:4933d14b83a2add03c23e04a3c397ffbe44f130403f1256881ee228869aee3bb", size = 1276933, upload-time = "2026-06-22T14:03:17.455Z" }
-wheels = [
-    { url = "https://files.pythonhosted.org/packages/39/1f/b62af7c661850ded4a550143e816613bd057b8c38fed534a6142735a77d0/mutagen-1.48.0-py3-none-any.whl", hash = "sha256:60a48d3e30173f728170fb0503f66b26026bf7629afb12546b18395c5cdf0bd6", size = 195754, upload-time = "2026-06-22T14:03:13.254Z" },
 ]
 
 [[package]]

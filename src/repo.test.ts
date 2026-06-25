@@ -20,10 +20,7 @@ function seedTrack(
   energy: number,
 ): number {
   const id = upsertTrack(db, {
-    mbid: null,
-    filePath: path,
-    contentHash: "h",
-    fileMtime: 0,
+    navidromeId: path,
     title: path,
     artist: "test",
   });
@@ -32,20 +29,10 @@ function seedTrack(
   return id;
 }
 
-test("upsert by file_path is idempotent", () => {
+test("upsert by navidrome_id is idempotent", () => {
   const db = openDb(":memory:");
-  const a = upsertTrack(db, {
-    mbid: null,
-    filePath: "/m/song.flac",
-    contentHash: "h1",
-    fileMtime: 1,
-  });
-  const b = upsertTrack(db, {
-    mbid: null,
-    filePath: "/m/song.flac",
-    contentHash: "h2",
-    fileMtime: 2,
-  });
+  const a = upsertTrack(db, { navidromeId: "nav-1", title: "first" });
+  const b = upsertTrack(db, { navidromeId: "nav-1", title: "renamed" });
   expect(a).toBe(b);
   const count = db.query(`SELECT count(*) AS n FROM tracks`).get() as {
     n: number;
