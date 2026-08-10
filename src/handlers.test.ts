@@ -32,18 +32,47 @@ test("chatHandler returns reply + hits for a valid message", async () => {
       message: {
         role: "assistant",
         content: "",
-        tool_calls: [{ function: { name: "search_tracks", arguments: { seed_artists: ["Mastodon"] } } }],
+        tool_calls: [
+          {
+            function: {
+              name: "search_tracks",
+              arguments: {
+                semantic_text: "progressive sludge metal",
+                seed_artists: ["Mastodon"],
+                exclude_seed_artists: true,
+                aggressive_min: 0.7,
+                count: 12,
+              },
+            },
+          },
+        ],
       },
       done: true,
     },
-    { message: { role: "assistant", content: "Here you go." }, done: true },
   ]);
 
-  const res = await chatHandler({ db, embedText: noEmbed, chat }, { message: "like Mastodon" });
+  const res = await chatHandler(
+    { db, embedText: noEmbed, chat },
+    { message: "12 tracks from other bands like Mastodon" },
+  );
   expect(res.status).toBe(200);
-  const data = (await res.json()) as { reply: string; hits: unknown[] };
-  expect(data.reply).toBe("Here you go.");
-  expect(data.hits).toHaveLength(1);
+  const data = (await res.json()) as {
+    reply: string;
+    hits: unknown[];
+    query: unknown;
+  };
+  expect(data.reply).toBe("No tracks remained after the requested exclusions.");
+  expect(data.hits).toHaveLength(0);
+  expect(data.query).toEqual({
+    version: 2,
+    semanticText: "progressive sludge metal",
+    seedArtists: ["Mastodon"],
+    excludeSeedArtists: true,
+    constraints: [],
+    preferences: [],
+    selection: { count: 12, artistVariety: "balanced" },
+    warnings: ["Dropped legacy aggressive_min without supporting user wording."],
+  });
   db.close();
 });
 

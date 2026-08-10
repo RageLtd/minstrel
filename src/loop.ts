@@ -6,12 +6,18 @@ import {
   type OllamaMessage,
 } from "./ollama";
 import {
+  NARRATION_PROMPT,
   SEARCH_TRACKS_TOOL,
+  SEARCH_RETRY_PROMPT,
   SYSTEM_PROMPT,
   parseSearchToolCall,
   type SearchQuery,
 } from "./tools";
-import { executeSearch, type SearchResult } from "./search";
+import {
+  executeSearch,
+  type SearchDiagnostics,
+  type SearchResult,
+} from "./search";
 import type { EmbedText } from "./embedder";
 import type { SearchHit } from "./repo";
 
@@ -28,6 +34,8 @@ export interface HandleResult {
   reply: string;
   hits: SearchHit[];
   query?: SearchQuery;
+  diagnostics?: SearchDiagnostics;
+  request: string;
   missingSeedArtists: string[];
 }
 
@@ -39,31 +47,71 @@ export interface HandleDeps {
   chatOptions?: ChatOptions;
 }
 
-/** Compact, vector-free view of the results for the model to narrate. */
-function summarizeForModel(result: SearchResult) {
+/** Compact, vector-free result facts for the narration turn. */
+function summarizeForModel(result: SearchResult, fallbackReply: string) {
   return {
     found: result.hits.length,
-    tracks: result.hits.slice(0, 50).map((h) => ({ title: h.title, artist: h.artist })),
+    requested: result.diagnostics.requested,
+    tracks: result.hits.slice(0, 50).map((hit) => ({
+      title: hit.title,
+      artist: hit.artist,
+    })),
     missing_seed_artists: result.missingSeedArtists,
+    shortfall_reason: result.diagnostics.shortfallReason,
+    deterministic_summary: fallbackReply,
   };
 }
 
-/** Fallback reply if the model returns empty content on the second turn. */
-function defaultReply(result: SearchResult): string {
-  const missing =
+/** Grounded summary built only from deterministic search output. */
+function resultReply(result: SearchResult): string {
+  const missingSuffix =
     result.missingSeedArtists.length > 0
-      ? ` (nothing by ${result.missingSeedArtists.join(", ")} in your library)`
+      ? ` Seed artists not found: ${result.missingSeedArtists.join(", ")}.`
       : "";
   if (result.hits.length === 0) {
-    return `I couldn't find anything matching that${missing}.`;
+    const reason =
+      result.diagnostics.searchableTracks === 0
+        ? "The library has no analyzed tracks."
+        : result.diagnostics.shortfallReason === "constraints"
+        ? "No tracks satisfied the explicit constraints."
+        : result.diagnostics.shortfallReason === "exclusions"
+          ? "No tracks remained after the requested exclusions."
+        : "No tracks matched that search.";
+    return `${reason}${missingSuffix}`;
   }
-  return `Found ${result.hits.length} tracks${missing}.`;
+
+  const artistsByKey = new Map<string, string>();
+  for (const hit of result.hits) {
+    const artist = hit.artist?.trim();
+    if (artist && !artistsByKey.has(artist.toLocaleLowerCase())) {
+      artistsByKey.set(artist.toLocaleLowerCase(), artist);
+    }
+  }
+  const artists = [...artistsByKey.values()];
+  const namedArtists = artists.slice(0, 4).join(", ");
+  const remainingArtists = artists.length > 4 ? ` and ${artists.length - 4} more` : "";
+  const artistSuffix = namedArtists ? ` across ${namedArtists}${remainingArtists}` : "";
+  const trackLabel = result.hits.length === 1 ? "track" : "tracks";
+  const requestedTrackLabel =
+    result.diagnostics.requested === 1 ? "track" : "tracks";
+  const countPrefix =
+    result.diagnostics.returned < result.diagnostics.requested
+      ? `Found ${result.diagnostics.returned} of ${result.diagnostics.requested} requested ${requestedTrackLabel}`
+      : `Found ${result.hits.length} ${trackLabel}`;
+  const shortfallSuffix =
+    result.diagnostics.shortfallReason === "constraints"
+      ? " Explicit constraints limited the result."
+      : result.diagnostics.shortfallReason === "exclusions"
+        ? " Requested exclusions limited the result."
+      : result.diagnostics.shortfallReason === "strictArtistCap"
+        ? " The requested per-artist cap limited the result."
+        : "";
+  return `${countPrefix}${artistSuffix}.${shortfallSuffix}${missingSuffix}`;
 }
 
 /**
  * One conversational turn: translate the user's vibe into a search via the LLM,
- * run it, then let the LLM narrate the result. The second turn passes no tools so
- * the model produces prose rather than calling the tool again.
+ * run deterministic matching, then summarize only the grounded result.
  */
 export async function handleMessage(
   deps: HandleDeps,
@@ -77,34 +125,47 @@ export async function handleMessage(
     { role: "user", content: userText },
   ];
 
-  const first = await chat(messages, [SEARCH_TRACKS_TOOL], {
+  const translationOptions: ChatOptions = {
     temperature: TRANSLATION_TEMPERATURE,
     ...options,
-  });
-  const call = firstToolCall(first);
+  };
+  let first = await chat(messages, [SEARCH_TRACKS_TOOL], translationOptions);
+  let call = firstToolCall(first);
   if (!call || call.name !== "search_tracks") {
-    return {
-      reply: first.message.content || "I couldn't turn that into a search.",
-      hits: [],
-      missingSeedArtists: [],
-    };
+    messages[0] = { role: "system", content: SEARCH_RETRY_PROMPT };
+    first = await chat(messages, [SEARCH_TRACKS_TOOL], translationOptions);
+    call = firstToolCall(first);
+  }
+  if (!call || call.name !== "search_tracks") {
+    throw new Error("music search planner did not call search_tracks");
   }
 
-  const query = parseSearchToolCall(call.args);
+  const query = parseSearchToolCall(call.args, userText);
   const result = await executeSearch(deps.db, deps.embedText, query);
+  const fallbackReply = resultReply(result);
 
+  messages[0] = { role: "system", content: NARRATION_PROMPT };
   messages.push(first.message);
   messages.push({
     role: "tool",
     tool_name: "search_tracks",
-    content: JSON.stringify(summarizeForModel(result)),
+    content: JSON.stringify(summarizeForModel(result, fallbackReply)),
   });
-  const second = await chat(messages, [], options);
+
+  let reply = fallbackReply;
+  try {
+    const second = await chat(messages, [], options);
+    reply = second.message.content.trim() || fallbackReply;
+  } catch {
+    // Search succeeded; narration failure must not discard grounded results.
+  }
 
   return {
-    reply: second.message.content || defaultReply(result),
+    reply,
     hits: result.hits,
     query,
+    diagnostics: result.diagnostics,
+    request: userText.trim(),
     missingSeedArtists: result.missingSeedArtists,
   };
 }

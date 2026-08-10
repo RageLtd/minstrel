@@ -66,6 +66,62 @@ button:disabled {
   color: var(--muted);
 }
 
+.query-debug {
+  margin: 1rem 0;
+  border: 1px solid #333842;
+  border-radius: 8px;
+  background: var(--panel);
+  overflow: hidden;
+}
+
+.query-debug summary {
+  padding: 0.65rem 0.8rem;
+  color: var(--fg);
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.query-details {
+  display: grid;
+  gap: 0;
+  margin: 0;
+  padding: 0 0.8rem 0.7rem;
+}
+
+.query-details div {
+  display: grid;
+  grid-template-columns: minmax(8rem, 0.35fr) 1fr;
+  gap: 0.75rem;
+  padding: 0.3rem 0;
+  border-top: 1px solid #2a2f38;
+}
+
+.query-details dt {
+  color: var(--muted);
+}
+
+.query-details dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.query-debug h3 {
+  margin: 0;
+  padding: 0.55rem 0.8rem 0.35rem;
+  border-top: 1px solid #333842;
+  font-size: 0.9rem;
+}
+
+.query-json {
+  margin: 0;
+  padding: 0.75rem 0.8rem;
+  border-top: 1px solid #333842;
+  background: #17191e;
+  color: #c7ccd5;
+  font-size: 0.78rem;
+  overflow-x: auto;
+}
+
 .tracks {
   list-style: none;
   padding: 0;
@@ -87,4 +143,11 @@ button:disabled {
 
 .saved {
   color: #6cc28a;
+}
+
+@media (max-width: 32rem) {
+  .query-details div {
+    grid-template-columns: 1fr;
+    gap: 0.1rem;
+  }
 }

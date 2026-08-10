@@ -12,7 +12,7 @@ WORKDIR /app
 # torch — the NGC build carries the Blackwell kernels the public wheels lack.
 RUN pip install --no-cache-dir \
       transformers \
-      librosa \
+      librosa==0.11.0 \
       soundfile \
       sqlite-vec
 

@@ -32,6 +32,13 @@ def _l2(t: torch.Tensor) -> torch.Tensor:
     return t / t.norm(dim=-1, keepdim=True).clamp_min(1e-12)
 
 
+def pair_probability(audio_embed: np.ndarray, text_pair: np.ndarray) -> float:
+    """Probability that audio matches the first of two text embeddings."""
+    sims = text_pair @ audio_embed
+    e = np.exp(sims - sims.max())
+    return float((e / e.sum())[0])
+
+
 class Clap:
     """Produces L2-normalised embeddings in CLAP's shared audio/text space.
 
@@ -56,12 +63,17 @@ class Clap:
     @torch.no_grad()
     def embed_audio(self, audio: np.ndarray) -> np.ndarray:
         """L2-normalised 512-dim embedding for one mono 48 kHz waveform."""
-        inputs = self.processor(
-            audio=audio, sampling_rate=CLAP_SR, return_tensors="pt"
-        )
+        return self.embed_audio_batch([audio])[0]
+
+    @torch.no_grad()
+    def embed_audio_batch(self, audio: list[np.ndarray]) -> np.ndarray:
+        """L2-normalised [n, 512] embeddings for mono 48 kHz waveforms."""
+        if not audio:
+            return np.empty((0, EMBED_DIM), dtype=np.float32)
+        inputs = self.processor(audio=audio, sampling_rate=CLAP_SR, return_tensors="pt")
         inputs = {k: v.to(self.device) for k, v in inputs.items()}
         feats = _l2(self.audio_model(**inputs).audio_embeds)
-        return feats[0].cpu().numpy().astype(np.float32)
+        return feats.cpu().numpy().astype(np.float32)
 
     @torch.no_grad()
     def embed_text(self, texts: list[str]) -> np.ndarray:
@@ -81,6 +93,4 @@ class Clap:
         "calm gentle music" yields an aggressiveness score.
         """
         txt = self.embed_text([positive, negative])  # [2, 512], normalised
-        sims = txt @ audio_embed  # audio_embed already normalised
-        e = np.exp(sims - sims.max())
-        return float((e / e.sum())[0])
+        return pair_probability(audio_embed, txt)

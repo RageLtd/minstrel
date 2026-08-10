@@ -31,7 +31,7 @@ export interface OllamaChatResponse {
 export interface ChatOptions {
   baseUrl?: string;
   model?: string;
-  think?: boolean;
+  think?: boolean | "low" | "medium" | "high" | "max";
   /** Sampling temperature. Unset = Ollama's server default. */
   temperature?: number;
   fetchImpl?: typeof fetch;
@@ -43,7 +43,7 @@ export async function chatWithTools(
   opts: ChatOptions = {},
 ): Promise<OllamaChatResponse> {
   const baseUrl = opts.baseUrl ?? process.env.OLLAMA_URL ?? "http://localhost:11434";
-  const model = opts.model ?? process.env.MINSTREL_MODEL ?? "qwen3";
+  const model = opts.model ?? process.env.MINSTREL_MODEL ?? "gemma4:26b";
   const doFetch = opts.fetchImpl ?? fetch;
   // Thinking defaults ON: reasoning-first models (GLM 5.x, and intermittently
   // the qwen3.x family) return EMPTY content on the tool-less narration turn

@@ -24,6 +24,11 @@ CREATE TABLE IF NOT EXISTS track_features (
   extra_json        TEXT
 );
 
+CREATE TABLE IF NOT EXISTS analysis_meta (
+  key   TEXT PRIMARY KEY,
+  value INTEGER NOT NULL
+);
+
 CREATE VIRTUAL TABLE IF NOT EXISTS track_vec USING vec0(
   track_id  INTEGER PRIMARY KEY,
   embedding FLOAT[512] distance_metric=cosine

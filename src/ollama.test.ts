@@ -45,9 +45,31 @@ test("posts a well-formed chat request to the configured host", async () => {
   expect(captured?.url).toBe("http://spark:11434/api/chat");
   expect(captured?.body.model).toBe("qwen3.5");
   expect(captured?.body.stream).toBe(false);
+  expect(captured?.body.think).toBe(true);
   expect(captured?.body.tools).toHaveLength(1);
   // no temperature given → no options key; the server default governs
   expect(captured?.body.options).toBeUndefined();
+});
+
+test("uses gemma4:26b when no model is configured", async () => {
+  const saved = process.env.MINSTREL_MODEL;
+  delete process.env.MINSTREL_MODEL;
+  let model: unknown;
+  const fakeFetch = (async (_url: string, init: RequestInit) => {
+    model = JSON.parse(init.body as string).model;
+    return new Response(JSON.stringify(resp()), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  try {
+    await chatWithTools([], [], { fetchImpl: fakeFetch });
+    expect(model).toBe("gemma4:26b");
+  } finally {
+    if (saved === undefined) {
+      delete process.env.MINSTREL_MODEL;
+    } else {
+      process.env.MINSTREL_MODEL = saved;
+    }
+  }
 });
 
 test("temperature rides in options when set", async () => {
@@ -98,4 +120,16 @@ test("thinking defaults ON, MINSTREL_THINK=false opts out, explicit option wins"
       process.env.MINSTREL_THINK = saved;
     }
   }
+});
+
+test("preserves an explicit thinking level", async () => {
+  let body: any;
+  const fakeFetch = (async (_url: string, init: RequestInit) => {
+    body = JSON.parse(init.body as string);
+    return new Response(JSON.stringify(resp()), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  await chatWithTools([], [], { think: "high", fetchImpl: fakeFetch });
+
+  expect(body.think).toBe("high");
 });

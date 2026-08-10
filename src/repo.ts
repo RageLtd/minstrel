@@ -22,14 +22,24 @@ export interface Features {
   extra?: Record<string, number>;
 }
 
-export interface SearchFilters {
-  bpmMin?: number;
-  bpmMax?: number;
-  energyMin?: number;
-  aggressiveMin?: number;
-  danceableMin?: number;
-  acousticMax?: number;
-}
+export type PreferenceFeature =
+  | "tempo"
+  | "energy"
+  | "aggression"
+  | "danceability"
+  | "acousticness"
+  | "novelty"
+  | "rhythmicIrregularity"
+  | "timbralComplexity"
+  | "dynamicContrast"
+  | "harmonicInstability";
+
+export type FeatureValues = Partial<Record<PreferenceFeature, number>>;
+export type FeatureDistributions = Record<PreferenceFeature, number[]>;
+
+// Keep this in lockstep with analyzer/minstrel_analyzer/features.py. Queries
+// ignore a partial backfill rather than comparing incompatible feature scales.
+export const AUDIO_FEATURE_VERSION = 3;
 
 export interface SearchHit {
   id: number;
@@ -38,7 +48,31 @@ export interface SearchHit {
   artist: string | null;
   album: string | null;
   distance: number;
+  featureValues: FeatureValues;
 }
+
+const FEATURE_EXPRESSIONS: Record<PreferenceFeature, string> = {
+  tempo: "f.bpm",
+  energy: "f.rms_energy",
+  aggression: "f.zs_aggressive",
+  danceability: "f.zs_danceable",
+  acousticness: "f.zs_acoustic",
+  novelty: `CASE WHEN json_valid(f.extra_json)
+                       AND json_extract(f.extra_json, '$.feature_version') = ${AUDIO_FEATURE_VERSION}
+                  THEN CAST(json_extract(f.extra_json, '$.novelty') AS REAL) END`,
+  rhythmicIrregularity: `CASE WHEN json_valid(f.extra_json)
+                                   AND json_extract(f.extra_json, '$.feature_version') = ${AUDIO_FEATURE_VERSION}
+                              THEN CAST(json_extract(f.extra_json, '$.rhythmic_irregularity') AS REAL) END`,
+  timbralComplexity: `CASE WHEN json_valid(f.extra_json)
+                                AND json_extract(f.extra_json, '$.feature_version') = ${AUDIO_FEATURE_VERSION}
+                           THEN CAST(json_extract(f.extra_json, '$.timbral_complexity') AS REAL) END`,
+  dynamicContrast: `CASE WHEN json_valid(f.extra_json)
+                              AND json_extract(f.extra_json, '$.feature_version') = ${AUDIO_FEATURE_VERSION}
+                         THEN CAST(json_extract(f.extra_json, '$.dynamic_contrast') AS REAL) END`,
+  harmonicInstability: `CASE WHEN json_valid(f.extra_json)
+                                  AND json_extract(f.extra_json, '$.feature_version') = ${AUDIO_FEATURE_VERSION}
+                             THEN CAST(json_extract(f.extra_json, '$.harmonic_instability') AS REAL) END`,
+};
 
 /** Insert or update a track by its file path, returning the row id. */
 export function upsertTrack(db: Database, t: TrackInput): number {
@@ -107,44 +141,105 @@ export function setEmbedding(
 }
 
 /**
- * k nearest tracks to a query embedding, then narrowed by scalar filters.
- * vec0's KNN runs before the joins, so we over-fetch and trim to `k` after
- * filtering — overfetch trades a little work for not starving filtered queries.
+ * k nearest tracks to a query embedding. Constraints are applied after fusion so
+ * diagnostics can distinguish retrieval from eligibility.
  */
 export function searchTracks(
   db: Database,
   query: Float32Array,
   k: number,
-  filters: SearchFilters = {},
-  overfetch = 6,
+  includeFeatureValues = false,
 ): SearchHit[] {
-  const conds: string[] = [];
-  const filterParams: number[] = [];
-  const add = (sql: string, val: number | undefined) => {
-    if (val !== undefined) {
-      conds.push(sql);
-      filterParams.push(val);
-    }
-  };
-  add("f.bpm >= ?", filters.bpmMin);
-  add("f.bpm <= ?", filters.bpmMax);
-  add("f.rms_energy >= ?", filters.energyMin);
-  add("f.zs_aggressive >= ?", filters.aggressiveMin);
-  add("f.zs_danceable >= ?", filters.danceableMin);
-  add("f.zs_acoustic <= ?", filters.acousticMax);
-
-  const fetchK = Math.min(k * overfetch, 2000);
+  const featureColumns = includeFeatureValues
+    ? `,\n           ${Object.entries(FEATURE_EXPRESSIONS)
+        .map(([name, expression]) => `${expression} AS ${name}`)
+        .join(",\n           ")}`
+    : "";
   const sql = `
-    SELECT t.id, t.navidrome_id AS navidromeId, t.title, t.artist, t.album, v.distance
+    SELECT t.id, t.navidrome_id AS navidromeId, t.title, t.artist, t.album, v.distance${featureColumns}
       FROM track_vec v
       JOIN tracks t ON t.id = v.track_id
       JOIN track_features f ON f.track_id = v.track_id
      WHERE v.embedding MATCH ? AND k = ?
-       ${conds.length ? `AND ${conds.join(" AND ")}` : ""}
-     ORDER BY v.distance
+     ORDER BY v.distance, t.id
      LIMIT ?`;
 
-  return db.query(sql).all(query, fetchK, ...filterParams, k) as SearchHit[];
+  type SearchRow = Omit<SearchHit, "featureValues"> &
+    Record<PreferenceFeature, number | null>;
+  const rows = db
+    .query(sql)
+    .all(query, k, k) as SearchRow[];
+  return rows.map((row) => {
+    const featureValues: FeatureValues = {};
+    for (const name of Object.keys(FEATURE_EXPRESSIONS) as PreferenceFeature[]) {
+      const value = row[name];
+      if (typeof value === "number" && Number.isFinite(value)) {
+        featureValues[name] = value;
+      }
+    }
+    const {
+      tempo,
+      energy,
+      aggression,
+      danceability,
+      acousticness,
+      novelty,
+      rhythmicIrregularity,
+      timbralComplexity,
+      dynamicContrast,
+      harmonicInstability,
+      ...hit
+    } = row;
+    return { ...hit, featureValues };
+  });
+}
+
+export function searchableTrackCount(db: Database): number {
+  const row = db
+    .query(
+      `SELECT count(*) AS n
+         FROM track_vec v
+         JOIN tracks t ON t.id = v.track_id
+         JOIN track_features f ON f.track_id = v.track_id`,
+    )
+    .get() as { n: number };
+  return row.n;
+}
+
+export function featureDistributions(db: Database): FeatureDistributions {
+  const columns = Object.entries(FEATURE_EXPRESSIONS)
+    .map(([name, expression]) => `${expression} AS ${name}`)
+    .join(",\n             ");
+  const rows = db
+    .query(
+      `SELECT ${columns}
+         FROM track_features f
+         JOIN tracks t ON t.id = f.track_id
+         JOIN track_vec v ON v.track_id = f.track_id`,
+    )
+    .all() as Record<PreferenceFeature, number | null>[];
+  return Object.fromEntries(
+    (Object.keys(FEATURE_EXPRESSIONS) as PreferenceFeature[]).map((name) => [
+      name,
+      rows
+        .map((row) => row[name])
+        .filter((value): value is number =>
+          typeof value === "number" && Number.isFinite(value)
+        )
+        .sort((a, b) => a - b),
+    ]),
+  ) as FeatureDistributions;
+}
+
+export function audioFeatureDataReady(db: Database): boolean {
+  const row = db
+    .query(
+      `SELECT value
+         FROM analysis_meta
+        WHERE key = 'audio_feature_version'`,
+    )
+    .get() as { value: number } | null;
+  return row?.value === AUDIO_FEATURE_VERSION;
 }
 
 /** All stored embeddings for tracks by a given artist (case-insensitive). */

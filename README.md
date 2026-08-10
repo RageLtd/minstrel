@@ -19,23 +19,32 @@ Two halves share one SQLite file.
 Navidrome's Subsonic API, downloads each original file (never `stream`, which may
 transcode and poison the embeddings), decodes it in memory, and stores a
 512-dimensional CLAP audio embedding, three zero-shot mood scores, and librosa
-scalars. Songs whose reported size is unchanged are skipped, so re-runs are
-incremental.
+descriptors for tempo, dynamics, rhythm, timbre, and harmony. A versioned feature
+set makes ordinary re-runs incremental while automatically re-analyzing tracks
+when the extractor changes. Feature-aware reranking stays disabled until that
+backfill and corpus-novelty calibration complete, so versions are never mixed.
 
 **Query** (Bun, CPU) — the orchestrator serves a chat UI. Your message goes to
 Ollama with exactly one tool, `search_tracks`; the model's arguments are
 validated into a typed query, the semantic text is embedded by the *same* CLAP
-model via the embed-server, and a KNN over `sqlite-vec` narrowed by scalar
-filters produces the tracks. A second, tool-less Ollama turn narrates the
-result, and one click writes it to Navidrome via `createPlaylist`.
+model via the embed-server, and KNN searches over `sqlite-vec` produce an
+over-fetched candidate pool. Multiple seed artists retain independent centroids,
+so their neighborhoods are fused rather than averaged into a generic midpoint.
+Explicit numeric constraints narrow the pool; every subjective quality is a
+corpus-percentile preference that reranks it within a bounded CLAP relevance
+window. Retrieval expands when constraints or artist diversity underfill, and
+artist-variety quotas backfill rather than silently reducing the requested count.
+One click writes the immutable result to Navidrome via `createPlaylist`.
 
 ```
 chat message
   → Ollama (search_tracks tool) → validated SearchQuery
   → semantic_text  → CLAP text embedding (embed-server)
-    seed_artists   → centroid of their stored audio embeddings
-  → KNN over track_vec + scalar filters
-  → Ollama narrates → createPlaylist(name, [navidrome_id…]) → Navidrome
+    seed_artists   → one centroid and KNN neighborhood per artist
+  → adaptive KNN over track_vec + validated hard constraints
+  → fuse seed neighborhoods + bounded percentile-preference reranking
+  → artist diversity + cardinality backfill
+  → grounded diagnostics → createPlaylist(name, [navidrome_id…]) → Navidrome
 ```
 
 Navidrome is the hub of record. Everything keys on its stable Persistent ID, so
@@ -74,7 +83,8 @@ docker compose run --rm analyzer
 
 First run downloads the CLAP checkpoint into the `hf-cache` volume, which is why
 the embed-server's healthcheck allows a 300-second start period. Re-run the
-analyzer whenever Navidrome picks up new music; unchanged tracks are skipped.
+analyzer whenever Navidrome picks up new music. Unchanged tracks are skipped
+unless their stored feature version is stale.
 
 Then open the orchestrator at `http://localhost:3000` and describe a vibe.
 
@@ -88,7 +98,7 @@ Everything is environment-driven; Compose reads `.env` automatically.
 | `NAVIDROME_PASS` | — | **Required.** |
 | `MUSIC_PATH` | `/mnt/music` | Host path bind-mounted read-only into Navidrome |
 | `OLLAMA_URL` | `http://host.docker.internal:11434` | Your existing Ollama server |
-| `MINSTREL_MODEL` | `qwen3.6:35b-a3b` | Ollama tag for query translation; must already be pulled |
+| `MINSTREL_MODEL` | `gemma4:26b` | Ollama tag for query translation; must already be pulled |
 | `MINSTREL_THINK` | `true` | Ollama thinking channel. Keep on: reasoning-first models (GLM 5.x, qwen3.x) return empty narration without it. `false` trades reliability for latency |
 | `NAVIDROME_PORT` | `4533` | Published port |
 | `ORCHESTRATOR_PORT` | `3000` | Published port |
@@ -137,7 +147,7 @@ schema.sql                    single source of truth for the DDL, applied by bot
 src/
   server.ts                   Bun.serve entrypoint: routes + dependency wiring
   handlers.ts                 /api/chat and /api/playlist, dependency-injected
-  loop.ts                     the two-turn conversational loop
+  loop.ts                     planner call + grounded result summary
   tools.ts                    search_tracks definition, system prompt, argument validation
   search.ts                   SearchQuery → ranked tracks
   repo.ts                     upserts + the filtered KNN
@@ -147,7 +157,7 @@ src/
 analyzer/minstrel_analyzer/
   analyze.py                  ingest pipeline + CLI
   clap.py                     CLAP audio/text embeddings + zero-shot scoring
-  features.py                 librosa scalars
+  features.py                 librosa descriptors for rhythm, timbre, dynamics, and harmony
   navidrome.py                Subsonic enumerate + download
   store.py                    SQLite writes
   embed_server.py             text-embedding HTTP service

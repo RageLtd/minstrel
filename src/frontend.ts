@@ -1,6 +1,12 @@
 import html from "solid-js/html";
 import { render } from "solid-js/web";
 import { createSignal } from "solid-js";
+import {
+  describeSearchDiagnostics,
+  describeSearchQuery,
+} from "./query-display";
+import type { SearchDiagnostics } from "./search";
+import type { SearchQuery } from "./tools";
 import "./index.css";
 
 interface Hit {
@@ -13,6 +19,9 @@ interface Hit {
 interface ChatResult {
   reply: string;
   hits: Hit[];
+  query?: SearchQuery;
+  diagnostics?: SearchDiagnostics;
+  request: string;
   missingSeedArtists: string[];
 }
 
@@ -22,13 +31,16 @@ function App() {
   const [result, setResult] = createSignal<ChatResult | null>(null);
   const [error, setError] = createSignal<string | null>(null);
   const [saved, setSaved] = createSignal<string | null>(null);
+  let requestGeneration = 0;
 
   async function ask() {
     const message = input().trim();
     if (!message) return;
+    const generation = ++requestGeneration;
     setLoading(true);
     setError(null);
     setSaved(null);
+    setResult(null);
     try {
       const res = await fetch("/api/chat", {
         method: "POST",
@@ -37,18 +49,20 @@ function App() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "request failed");
+      if (generation !== requestGeneration) return;
       setResult(data as ChatResult);
     } catch (e) {
+      if (generation !== requestGeneration) return;
       setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (generation === requestGeneration) setLoading(false);
     }
   }
 
   async function save() {
     const r = result();
     if (!r || r.hits.length === 0) return;
-    const name = input().trim().slice(0, 60) || "Minstrel mix";
+    const name = r.request.slice(0, 60) || "Minstrel mix";
     try {
       const res = await fetch("/api/playlist", {
         method: "POST",
@@ -57,8 +71,10 @@ function App() {
       });
       const data = await res.json();
       if (!res.ok) throw new Error(data.error ?? "save failed");
+      if (result() !== r) return;
       setSaved(String(data.id));
     } catch (e) {
+      if (result() !== r) return;
       setError(e instanceof Error ? e.message : String(e));
     }
   }
@@ -88,6 +104,42 @@ function App() {
         html`
           <section class="result">
             <p class="reply">${() => result()!.reply}</p>
+            ${() =>
+              result()!.query &&
+              html`
+                <details class="query-debug" open>
+                  <summary>Search query</summary>
+                  <dl class="query-details">
+                    ${() =>
+                      describeSearchQuery(result()!.query!).map(
+                        (detail) => html`
+                          <div>
+                            <dt>${detail.label}</dt>
+                            <dd>${detail.value}</dd>
+                          </div>
+                        `,
+                      )}
+                  </dl>
+                  ${() =>
+                    result()!.diagnostics &&
+                    html`
+                      <h3>Execution</h3>
+                      <dl class="query-details">
+                        ${() =>
+                          describeSearchDiagnostics(result()!.diagnostics!).map(
+                            (detail) => html`
+                              <div>
+                                <dt>${detail.label}</dt>
+                                <dd>${detail.value}</dd>
+                              </div>
+                            `,
+                          )}
+                      </dl>
+                    `}
+                  <pre class="query-json" aria-label="Normalized search query JSON">${() =>
+                    JSON.stringify(result()!.query, null, 2)}</pre>
+                </details>
+              `}
             <ul class="tracks">
               ${() =>
                 result()!.hits.map(

@@ -29,7 +29,7 @@ test("sqlite-vec loads and returns cosine-nearest neighbours in order", () => {
   db.close();
 });
 
-test("schema creates tracks + features tables", () => {
+test("schema creates tracks, features, and analysis metadata tables", () => {
   const db = openDb(":memory:");
   const names = db
     .query(`SELECT name FROM sqlite_master WHERE type='table' ORDER BY name`)
@@ -37,5 +37,6 @@ test("schema creates tracks + features tables", () => {
   const set = new Set(names.map((n) => n.name));
   expect(set.has("tracks")).toBe(true);
   expect(set.has("track_features")).toBe(true);
+  expect(set.has("analysis_meta")).toBe(true);
   db.close();
 });

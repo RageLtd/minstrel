@@ -66,7 +66,8 @@ services:
       # Your existing Ollama. Default reaches a server on the Docker host; set a
       # LAN address in .env if it lives elsewhere.
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
-      MINSTREL_MODEL: ${MINSTREL_MODEL:-qwen3.6:35b-a3b}
+      MINSTREL_MODEL: ${MINSTREL_MODEL:-gemma4:26b}
+      MINSTREL_THINK: ${MINSTREL_THINK:-true}
       NAVIDROME_URL: http://navidrome:4533
       NAVIDROME_USER: ${NAVIDROME_USER:?set NAVIDROME_USER in .env}
       NAVIDROME_PASS: ${NAVIDROME_PASS:?set NAVIDROME_PASS in .env}

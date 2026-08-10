@@ -60,6 +60,7 @@ CREATE TABLE tracks (
 );
 CREATE TABLE track_features (track_id PK, bpm, rms_energy, spectral_centroid,
   zs_aggressive, zs_danceable, zs_acoustic, extra_json);
+CREATE TABLE analysis_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE VIRTUAL TABLE track_vec USING vec0(track_id PK, embedding FLOAT[512] cosine);
 ```
 
@@ -67,10 +68,15 @@ CREATE VIRTUAL TABLE track_vec USING vec0(track_id PK, embedding FLOAT[512] cosi
 
 1. Enumerate songs via the Subsonic API (`getAlbumList2` paged → `getAlbum`), each
    carrying id, title, artist, album, size, and `musicBrainzId`.
-2. Skip any song whose `size` matches the stored `nav_size` → incremental.
+2. Skip any song whose `size` and stored feature version are current → incremental,
+   with automatic backfill after the feature extractor changes.
 3. **Download the original** via the `download` endpoint (never `stream` — that may
    transcode and would poison the embeddings), decode in memory, then discard the bytes.
-4. CLAP audio embedding (GPU) + CLAP zero-shot mood scores + librosa scalars.
+4. CLAP audio embedding (GPU) + CLAP zero-shot mood scores + librosa descriptors:
+   tempo/energy/brightness, rhythmic irregularity, timbral complexity, dynamic
+   contrast, harmonic instability, percussive balance, flatness, and zero-crossing
+   rate. Robust median/MAD distance across the derived dimensions becomes a
+   corpus-relative novelty percentile.
 5. Upsert tracks + features + embedding keyed by `navidrome_id`.
 
 ## Query path (orchestrator)
@@ -78,14 +84,194 @@ CREATE VIRTUAL TABLE track_vec USING vec0(track_id PK, embedding FLOAT[512] cosi
 ```
 chat msg → Ollama (search_tracks tool) → parse/validate → executeSearch:
   semantic_text → CLAP text-encode (embed-server) → KNN over track_vec
-  seed_artists  → centroid of their stored embeddings → KNN
+  seed_artists  → independent per-artist centroids → one KNN neighborhood each
+  fuse by best seed rank, with semantic rank as a secondary signal
   apply scalar filters; missing seed artists fall back to semantic + are reported
-→ second Ollama turn narrates the result
+  softly rerank for requested novelty/rhythm/timbre/dynamics/harmony preferences
+  over-fetch candidates → apply focused/balanced/wide per-artist cap
+→ deterministic grounded result summary (no second LLM call)
 → createPlaylist(name, [navidrome_id...]) straight to Navidrome
 ```
 
 Query text is embedded by the **same** CLAP model as the audio (the embed-server), so
 text and audio share one space.
+
+## Search plan V2: intent, relevance, and cardinality
+
+The planner must not turn ordinary descriptive language into arbitrary eligibility
+thresholds. "Wake me up," "higher energy," and "more danceable" describe ranking
+preferences; "over 140 BPM" and "exclude Primus" are constraints. Treating both as
+SQL predicates systematically starves compound requests and makes the returned count
+unpredictable.
+
+The V2 query path follows four invariants:
+
+1. The LLM translates language but never invents numerical search policy.
+2. Subjective audio qualities affect ordering, not eligibility.
+3. Hard constraints carry verifiable evidence from the original request and are never
+   silently relaxed.
+4. Preference-only searches return the requested count whenever enough analyzed tracks
+   exist; any shortfall has a deterministic, surfaced reason.
+
+### Planner contract
+
+The normalized plan separates constraints, preferences, and selection policy:
+
+```ts
+interface SearchPlan {
+  version: 2;
+  semanticText: string;
+  seedArtists?: string[];
+  excludeSeedArtists?: boolean;
+  constraints: Array<{
+    feature: "tempoBpm" | "featurePercentile";
+    operator: "min" | "max";
+    value: number;
+    percentileFeature?: PreferenceFeature;
+    evidence: string;
+  }>;
+  preferences: Array<{
+    feature: PreferenceFeature;
+    direction: "higher" | "lower";
+    strength: "subtle" | "normal" | "strong";
+    evidence: string;
+  }>;
+  selection: {
+    count: number;
+    artistVariety: "focused" | "balanced" | "wide";
+    strictArtistCap?: number;
+  };
+}
+```
+
+`PreferenceFeature` covers tempo, energy, aggression, danceability, acousticness,
+novelty, rhythmic irregularity, timbral complexity, dynamic contrast, and harmonic
+instability. Strength is an enum mapped to fixed deterministic weights; the model does
+not emit thresholds for adjectives. BPM and count constraints are accepted only when
+their numeric evidence occurs in the user request. User-specified percentile constraints
+(for example, "top 20% most aggressive") are allowed; inferred subjective thresholds are
+not. Invalid, contradictory, or unsupported conditions are rejected or downgraded to
+preferences with a diagnostic warning.
+
+### Corpus calibration
+
+Subjective features are converted to empirical percentile ranks over the current
+analyzed corpus:
+
+```text
+percentile(value) = average_zero_based_rank(value) / (track_count - 1)
+```
+
+For a higher preference, fit is `percentile(value)`; for lower, fit is
+`1 - percentile(value)`. This makes controls comparable despite compressed zero-shot
+scores, skewed Librosa distributions, and outliers. Raw BPM remains the unit for an
+explicit numerical constraint, while faster/slower preferences use BPM percentile.
+Novelty is already stored as a corpus percentile. Calibration is built from existing
+SQLite values and requires no audio re-analysis or schema migration.
+
+At the current library size calibration is loaded in one SQLite pass per search. A
+cross-request cache is allowed only after the analyzer owns a durable corpus-revision
+counter; timestamps and row counts are not sufficient invalidation keys.
+
+### Retrieval and bounded reranking
+
+CLAP relevance remains the candidate generator. Semantic text and each seed-artist
+centroid are searched independently, then fused into one base-relevance order. The V2
+scorer consumes that order through a stable `BaseCandidate` contract so seed-fusion
+calibration can evolve separately from preference semantics.
+
+Preferences combine by weighted average rather than intersection. Correlated descriptors
+are grouped so several measurements of texture/change do not receive accidental multiple
+votes. Their influence is bounded by the relevance gap between the requested boundary
+and an outer window:
+
+```text
+c = requested track count
+preference_budget = strength * (base_score(2c) - base_score(c))
+final_score(track) = base_score(track) + preference_budget * (1 - preference_fit(track))
+```
+
+This permits meaningful reordering among relevant tracks without allowing an unrelated
+global feature outlier to overwhelm CLAP similarity. Missing feature values are omitted
+from that track's preference denominator and reported; they are not treated as either a
+perfect or worst match.
+
+### Constraints, adaptive retrieval, and diversity
+
+Hard constraints define eligibility. Because sqlite-vec finds nearest neighbors before
+joined scalar predicates apply, constrained retrieval expands deterministically: start
+with `max(4 * count, 128)` candidates per query vector, double while the final selection
+is underfilled, and stop only when enough eligible tracks exist or the searchable corpus
+is exhausted. The semantic embedding and seed centroids are computed once and reused.
+
+Artist variety is a first-pass quota, not an accidental result ceiling. Focused,
+balanced, and wide modes first select up to six, two, and one tracks per artist
+respectively, then backfill skipped candidates in final-score order until the requested
+count is reached. Only an explicit `strictArtistCap` forbids that backfill.
+
+The resulting cardinality contract is:
+
+```text
+preference-only: returned = min(requested, available analyzed tracks)
+strict constraints: returned = min(requested, eligible tracks)
+```
+
+Constraints are never silently weakened. When fewer tracks are eligible, the response
+states the shortfall and identifies the limiting constraints.
+
+### Diagnostics and UI truthfulness
+
+Search execution returns structured diagnostics alongside hits:
+
+```ts
+interface SearchDiagnostics {
+  requested: number;
+  returned: number;
+  searchableTracks: number;
+  retrievalPasses: number;
+  retrievedCandidates: number;
+  eligibleCandidates: number;
+  preferenceReranked: boolean;
+  diversityBackfilled: number;
+  exhaustedCorpus: boolean;
+  warnings: string[];
+  shortfallReason?: "constraints" | "exclusions" | "corpus" | "strictArtistCap";
+}
+```
+
+The query panel renders the understood sound, seed behavior, hard constraints, ranking
+preferences, selection policy, and execution outcome as separate sections. It never
+labels a preference as a minimum. Replies distinguish an empty library, missing seeds,
+constraint exhaustion, strict diversity, and ordinary successful matching.
+
+Each frontend result is bound to an immutable snapshot of the request that produced it.
+Beginning another request clears the old result, and saving uses the snapshot's playlist
+name and Navidrome IDs rather than mutable composer text.
+
+### Delivery slices and acceptance tests
+
+The implementation is staged so behavior remains reviewable:
+
+1. Add V2 types, planner schema, source-evidence validation, execution diagnostics, and a
+   temporary adapter for legacy tool arguments.
+2. Add cached empirical calibration and move every inferred scalar quality into the
+   unified bounded preference scorer.
+3. Add adaptive KNN expansion and diversity backfill with explicit cardinality reasons.
+4. Bind immutable frontend results, render V2 diagnostics, validate live intent probes,
+   then remove legacy hard-filter semantics.
+
+Tests enforce invariants rather than relying only on prompt examples: preferences never
+reduce cardinality; every strict result satisfies every constraint; unsupported hard
+constraints cannot survive normalization; preference influence stays inside its relevance
+window; diversity backfills unless explicitly strict; and returned count equals the
+cardinality contract. Golden cases include wake-up music, "Mastodon but heavier,"
+"over 140 BPM," explicit artist exclusion, a user-specified feature percentile, and
+contradictory bounds.
+
+Prompt-only hardening, silent automatic relaxation, and iterative LLM replanning are
+deliberately rejected. Prompts are defense in depth, silent relaxation is untruthful, and
+additional model turns increase latency and nondeterminism without adding information the
+deterministic executor cannot derive itself.
 
 ## Status
 

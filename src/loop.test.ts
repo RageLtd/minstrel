@@ -48,7 +48,7 @@ function queuedChat(responses: OllamaChatResponse[]) {
   let i = 0;
   const fn = (async (messages: OllamaMessage[], tools: OllamaTool[], opts?: ChatOptions) => {
     calls.push({ messages: structuredClone(messages), tools, opts });
-    return responses[i++]!;
+    return responses[i++] ?? textResponse("");
   }) as unknown as typeof chatWithTools;
   return { fn, calls };
 }
@@ -57,18 +57,22 @@ const noEmbed = async (): Promise<Float32Array> => {
   throw new Error("embedText should not be called");
 };
 
-test("happy path: translates, searches, and narrates", async () => {
+test("happy path translates, searches, and summarizes grounded hits", async () => {
   const db = openDb(":memory:");
   const id = seed(db, "Mastodon", basis([0, 1]));
 
   const { fn, calls } = queuedChat([
-    toolResponse({ seed_artists: ["Mastodon"], count: 5 }),
+    toolResponse({
+      semantic_text: "progressive sludge metal",
+      seed_artists: ["Mastodon"],
+      count: 1,
+    }),
     textResponse("Here's a set in that vein."),
   ]);
 
   const res = await handleMessage(
-    { db, embedText: noEmbed, chat: fn },
-    "something like Mastodon",
+    { db, embedText: async () => basis([0, 1]), chat: fn },
+    "1 track like Mastodon",
   );
 
   expect(res.query?.seedArtists).toEqual(["Mastodon"]);
@@ -80,50 +84,157 @@ test("happy path: translates, searches, and narrates", async () => {
   // translation turn is near-greedy; narration keeps the server default
   expect(calls[0]!.opts?.temperature).toBe(TRANSLATION_TEMPERATURE);
   expect(calls[1]!.opts?.temperature).toBeUndefined();
+  expect(res.request).toBe("1 track like Mastodon");
   db.close();
 });
 
-test("model declining to call the tool surfaces its prose", async () => {
+test("model declining to call the tool is retried instead of trusted", async () => {
   const db = openDb(":memory:");
-  const { fn } = queuedChat([textResponse("What sort of mood are you after?")]);
+  const id = seed(db, "Mastodon", basis([0, 1]));
+  const { fn, calls } = queuedChat([
+    textResponse("I couldn't find anything like that"),
+    toolResponse({
+      semantic_text: "progressive sludge metal",
+      seed_artists: ["Mastodon"],
+      count: 1,
+    }),
+  ]);
 
-  const res = await handleMessage({ db, embedText: noEmbed, chat: fn }, "hi");
+  const res = await handleMessage(
+    { db, embedText: async () => basis([0, 1]), chat: fn },
+    "1 track please",
+  );
 
-  expect(res.hits).toEqual([]);
-  expect(res.reply).toBe("What sort of mood are you after?");
+  expect(res.hits[0]!.id).toBe(id);
+  expect(res.reply).toBe("Found 1 track across Mastodon.");
+  expect(calls).toHaveLength(3);
+  expect(calls[1]!.messages[0]!.content).toContain("violated the protocol");
+  expect(calls[1]!.opts?.temperature).toBe(TRANSLATION_TEMPERATURE);
+  expect(calls[2]!.tools).toEqual([]);
   db.close();
 });
 
-test("missing seed artist is reported to the model and the caller", async () => {
+test("repeated planner refusal fails instead of inventing a search result", async () => {
+  const db = openDb(":memory:");
+  const { fn } = queuedChat([
+    textResponse("I couldn't find anything like that"),
+    textResponse("Still nothing"),
+  ]);
+
+  await expect(handleMessage({ db, embedText: noEmbed, chat: fn }, "hi")).rejects.toThrow(
+    "music search planner did not call search_tracks",
+  );
+  db.close();
+});
+
+test("missing seed artist is reported in the grounded summary and result", async () => {
   const db = openDb(":memory:");
   const tool = seed(db, "Tool", basis([1, 1]));
 
-  const { fn, calls } = queuedChat([
-    toolResponse({ seed_artists: ["Ghost"], semantic_text: "knotty prog" }),
-    textResponse("No Ghost on hand, but here's the sound."),
+  const { fn } = queuedChat([
+    toolResponse({
+      seed_artists: ["Ghost"],
+      semantic_text: "knotty prog",
+      count: 1,
+    }),
   ]);
   const embedText = async (): Promise<Float32Array> => basis([1, 1]);
 
-  const res = await handleMessage({ db, embedText, chat: fn }, "like Ghost");
+  const res = await handleMessage({ db, embedText, chat: fn }, "1 track like Ghost");
 
   expect(res.missingSeedArtists).toEqual(["Ghost"]);
   expect(res.hits[0]!.id).toBe(tool);
-  const toolMsg = calls[1]!.messages.find((m) => m.role === "tool");
-  expect(toolMsg?.content).toContain("Ghost");
+  expect(res.reply).toBe("Found 1 track across Tool. Seed artists not found: Ghost.");
   db.close();
 });
 
-test("empty model reply falls back to a generated summary", async () => {
+test("result summary uses only artists present in the hits", async () => {
   const db = openDb(":memory:");
   seed(db, "Mastodon", basis([0, 1]));
 
   const { fn } = queuedChat([
-    toolResponse({ seed_artists: ["Mastodon"] }),
-    textResponse(""),
+    toolResponse({
+      semantic_text: "progressive sludge metal",
+      seed_artists: ["Mastodon"],
+      count: 1,
+    }),
   ]);
 
-  const res = await handleMessage({ db, embedText: noEmbed, chat: fn }, "x");
+  const res = await handleMessage(
+    { db, embedText: async () => basis([0, 1]), chat: fn },
+    "1 track x",
+  );
 
-  expect(res.reply).toBe("Found 1 tracks.");
+  expect(res.reply).toBe("Found 1 track across Mastodon.");
+  db.close();
+});
+
+test("result summary collapses artist casing variants", async () => {
+  const db = openDb(":memory:");
+  seed(db, "Mastodon", basis([0, 1]));
+  seed(db, "MASTODON", basis([0, 1], [1, 0.01]));
+  const { fn } = queuedChat([
+    toolResponse({
+      semantic_text: "progressive sludge metal",
+      seed_artists: ["Mastodon"],
+      count: 2,
+    }),
+  ]);
+
+  const res = await handleMessage(
+    { db, embedText: async () => basis([0, 1]), chat: fn },
+    "2 tracks x",
+  );
+
+  expect(res.reply).toBe("Found 2 tracks across Mastodon.");
+  db.close();
+});
+
+test("constraint shortfalls are explained instead of reported as generic matching", async () => {
+  const db = openDb(":memory:");
+  const slow = seed(db, "Slow", basis([0, 1]));
+  const fast = seed(db, "Fast", basis([0, 1], [1, 0.1]));
+  upsertFeatures(db, slow, { rmsEnergy: 0.5, bpm: 100 });
+  upsertFeatures(db, fast, { rmsEnergy: 0.5, bpm: 160 });
+  const { fn } = queuedChat([
+    toolResponse({
+      semantic_text: "fast metal",
+      constraints: [
+        {
+          feature: "tempo_bpm",
+          operator: "min",
+          value: 140,
+          evidence: "over 140 BPM",
+        },
+      ],
+      count: 2,
+    }),
+  ]);
+
+  const res = await handleMessage(
+    { db, embedText: async () => basis([0, 1]), chat: fn },
+    "2 tracks of metal over 140 BPM",
+  );
+
+  expect(res.hits.map((hit) => hit.artist)).toEqual(["Fast"]);
+  expect(res.reply).toBe(
+    "Found 1 of 2 requested tracks across Fast. Explicit constraints limited the result.",
+  );
+  expect(res.diagnostics?.shortfallReason).toBe("constraints");
+  db.close();
+});
+
+test("empty analyzed corpus is distinguished from an ordinary miss", async () => {
+  const db = openDb(":memory:");
+  const { fn } = queuedChat([
+    toolResponse({ semantic_text: "metal", count: 1 }),
+  ]);
+
+  const res = await handleMessage(
+    { db, embedText: async () => basis([0, 1]), chat: fn },
+    "1 metal track",
+  );
+
+  expect(res.reply).toBe("The library has no analyzed tracks.");
   db.close();
 });
