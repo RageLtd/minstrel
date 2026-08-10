@@ -61,7 +61,8 @@ Rules:
 - If the user names artists to sound like, pass the real ones in seed_artists.
 - Decompose "like X but more Y": the "like X" half goes to seed_artists/semantic_text; the "more Y" modifier sets a feature bound — "higher energy" -> energy_min, "more aggressive" -> aggressive_min, "more electronic" -> a low acoustic_max, "faster" -> bpm_min.
 - Feature values are 0..1. Be moderate (around 0.6-0.8 for "more X"), not extreme.
-- Always call search_tracks. Never reply in prose.`;
+- Always call search_tracks first. Never reply in prose before the search has run.
+- After a search_tracks result comes back, the translation is done — reply in plain prose: briefly describe the found tracks for the user, mention any missing seed artists, and do not call the tool again.`;
 
 function finiteNumber(v: unknown): number | undefined {
   return typeof v === "number" && Number.isFinite(v) ? v : undefined;

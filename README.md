@@ -89,6 +89,7 @@ Everything is environment-driven; Compose reads `.env` automatically.
 | `MUSIC_PATH` | `/mnt/music` | Host path bind-mounted read-only into Navidrome |
 | `OLLAMA_URL` | `http://host.docker.internal:11434` | Your existing Ollama server |
 | `MINSTREL_MODEL` | `qwen3.6:35b-a3b` | Ollama tag for query translation; must already be pulled |
+| `MINSTREL_THINK` | `true` | Ollama thinking channel. Keep on: reasoning-first models (GLM 5.x, qwen3.x) return empty narration without it. `false` trades reliability for latency |
 | `NAVIDROME_PORT` | `4533` | Published port |
 | `ORCHESTRATOR_PORT` | `3000` | Published port |
 | `MINSTREL_DB` | `minstrel.db` | SQLite path (`/data/minstrel.db` in containers) |

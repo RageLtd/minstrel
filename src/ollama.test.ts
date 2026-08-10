@@ -46,4 +46,56 @@ test("posts a well-formed chat request to the configured host", async () => {
   expect(captured?.body.model).toBe("qwen3.5");
   expect(captured?.body.stream).toBe(false);
   expect(captured?.body.tools).toHaveLength(1);
+  // no temperature given → no options key; the server default governs
+  expect(captured?.body.options).toBeUndefined();
+});
+
+test("temperature rides in options when set", async () => {
+  let captured: { body: any } | undefined;
+  const fakeFetch = (async (_url: string, init: RequestInit) => {
+    captured = { body: JSON.parse(init.body as string) };
+    return new Response(JSON.stringify(resp()), { status: 200 });
+  }) as unknown as typeof fetch;
+
+  await chatWithTools([{ role: "user", content: "hi" }], [], {
+    temperature: 0.1,
+    fetchImpl: fakeFetch,
+  });
+
+  expect(captured?.body.options).toEqual({ temperature: 0.1 });
+});
+
+async function capturedThink(opts: Parameters<typeof chatWithTools>[2]) {
+  let think: unknown;
+  const fakeFetch = (async (_url: string, init: RequestInit) => {
+    think = JSON.parse(init.body as string).think;
+    return new Response(JSON.stringify(resp()), { status: 200 });
+  }) as unknown as typeof fetch;
+  await chatWithTools([{ role: "user", content: "hi" }], [], {
+    ...opts,
+    fetchImpl: fakeFetch,
+  });
+  return think;
+}
+
+test("thinking defaults ON, MINSTREL_THINK=false opts out, explicit option wins", async () => {
+  const saved = process.env.MINSTREL_THINK;
+  delete process.env.MINSTREL_THINK;
+  try {
+    expect(await capturedThink({})).toBe(true);
+
+    process.env.MINSTREL_THINK = "false";
+    expect(await capturedThink({})).toBe(false);
+    expect(await capturedThink({ think: true })).toBe(true);
+
+    process.env.MINSTREL_THINK = "true";
+    expect(await capturedThink({})).toBe(true);
+    expect(await capturedThink({ think: false })).toBe(false);
+  } finally {
+    if (saved === undefined) {
+      delete process.env.MINSTREL_THINK;
+    } else {
+      process.env.MINSTREL_THINK = saved;
+    }
+  }
 });

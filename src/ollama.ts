@@ -32,6 +32,8 @@ export interface ChatOptions {
   baseUrl?: string;
   model?: string;
   think?: boolean;
+  /** Sampling temperature. Unset = Ollama's server default. */
+  temperature?: number;
   fetchImpl?: typeof fetch;
 }
 
@@ -43,6 +45,12 @@ export async function chatWithTools(
   const baseUrl = opts.baseUrl ?? process.env.OLLAMA_URL ?? "http://localhost:11434";
   const model = opts.model ?? process.env.MINSTREL_MODEL ?? "qwen3";
   const doFetch = opts.fetchImpl ?? fetch;
+  // Thinking defaults ON: reasoning-first models (GLM 5.x, and intermittently
+  // the qwen3.x family) return EMPTY content on the tool-less narration turn
+  // when the thinking channel is suppressed — found deterministically by
+  // minstrel-evals. Costs thinking-token latency; opt out per-deploy with
+  // MINSTREL_THINK=false.
+  const think = opts.think ?? process.env.MINSTREL_THINK !== "false";
 
   const res = await doFetch(`${baseUrl}/api/chat`, {
     method: "POST",
@@ -52,7 +60,10 @@ export async function chatWithTools(
       messages,
       tools,
       stream: false,
-      think: opts.think ?? false,
+      think,
+      ...(opts.temperature !== undefined
+        ? { options: { temperature: opts.temperature } }
+        : {}),
     }),
   });
   if (!res.ok) {

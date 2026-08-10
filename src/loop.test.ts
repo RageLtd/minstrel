@@ -1,8 +1,9 @@
 import { test, expect } from "bun:test";
 import { openDb, toEmbedding, EMBED_DIM } from "./db";
 import { upsertTrack, upsertFeatures, setEmbedding } from "./repo";
-import { handleMessage } from "./loop";
+import { handleMessage, TRANSLATION_TEMPERATURE } from "./loop";
 import {
+  type ChatOptions,
   type OllamaChatResponse,
   type OllamaMessage,
   type OllamaTool,
@@ -41,12 +42,12 @@ function textResponse(content: string): OllamaChatResponse {
   return { message: { role: "assistant", content }, done: true };
 }
 
-/** Fake chat that replays a queue and records the messages each call saw. */
+/** Fake chat that replays a queue and records what each call saw. */
 function queuedChat(responses: OllamaChatResponse[]) {
-  const calls: { messages: OllamaMessage[]; tools: OllamaTool[] }[] = [];
+  const calls: { messages: OllamaMessage[]; tools: OllamaTool[]; opts?: ChatOptions }[] = [];
   let i = 0;
-  const fn = (async (messages: OllamaMessage[], tools: OllamaTool[]) => {
-    calls.push({ messages: structuredClone(messages), tools });
+  const fn = (async (messages: OllamaMessage[], tools: OllamaTool[], opts?: ChatOptions) => {
+    calls.push({ messages: structuredClone(messages), tools, opts });
     return responses[i++]!;
   }) as unknown as typeof chatWithTools;
   return { fn, calls };
@@ -76,6 +77,9 @@ test("happy path: translates, searches, and narrates", async () => {
   // second turn carried a tool-result message and no tools
   expect(calls[1]!.messages.some((m) => m.role === "tool")).toBe(true);
   expect(calls[1]!.tools).toEqual([]);
+  // translation turn is near-greedy; narration keeps the server default
+  expect(calls[0]!.opts?.temperature).toBe(TRANSLATION_TEMPERATURE);
+  expect(calls[1]!.opts?.temperature).toBeUndefined();
   db.close();
 });
 

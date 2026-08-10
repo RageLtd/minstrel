@@ -15,6 +15,15 @@ import { executeSearch, type SearchResult } from "./search";
 import type { EmbedText } from "./embedder";
 import type { SearchHit } from "./repo";
 
+/**
+ * Sampling temperature for the translation turn. Vibe→query is a structured
+ * task with a schema to hit — near-greedy decoding kills the coin-flip
+ * failure class (no tool call at all) that default temperature produces.
+ * The narration turn deliberately keeps the server default: variety in
+ * prose (and in how a vibe is interpreted) is a feature, not a flake.
+ */
+export const TRANSLATION_TEMPERATURE = 0.1;
+
 export interface HandleResult {
   reply: string;
   hits: SearchHit[];
@@ -68,7 +77,10 @@ export async function handleMessage(
     { role: "user", content: userText },
   ];
 
-  const first = await chat(messages, [SEARCH_TRACKS_TOOL], options);
+  const first = await chat(messages, [SEARCH_TRACKS_TOOL], {
+    temperature: TRANSLATION_TEMPERATURE,
+    ...options,
+  });
   const call = firstToolCall(first);
   if (!call || call.name !== "search_tracks") {
     return {
