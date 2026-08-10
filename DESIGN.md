@@ -89,9 +89,17 @@ text and audio share one space.
 
 ## Status
 
-- **Done:** shared schema; orchestrator data spine (sqlite-vec KNN + filtered search);
-  CLAP analyzer core (embeddings, zero-shot, librosa) proven on MPS; cross-language
-  storage handshake; LLM translation + search execution + conversational loop. All tested.
-- **In progress:** repointing the analyzer onto Navidrome (this change).
-- **Next:** Navidrome client for `createPlaylist`; the `Bun.serve` entrypoint + webui;
-  one live end-to-end smoke once Ollama + the embed-server are reachable.
+- **Built & tested:** the whole stack — shared schema; orchestrator data spine
+  (sqlite-vec KNN + filtered search); Navidrome-sourced CLAP analyzer (embeddings,
+  zero-shot, librosa) plus the embed-server; cross-language storage handshake; LLM
+  translation, search execution, and the conversational loop; the Navidrome
+  `createPlaylist` writer; the `Bun.serve` entrypoint + SolidJS chat UI; and the
+  Docker Compose for the Spark (Ollama is external).
+- **Verified on the dev Mac:** all tests green (TS + Python); the orchestrator image
+  builds, boots, and serves the bundled UI in production.
+- **Remaining — needs the Spark:**
+  1. `docker compose build` — confirm the NGC image tag supports GB10/aarch64
+     (`nvcr.io` login may be required) and the deps install atop the image's torch.
+  2. Copy `.env.example` → `.env`; fill credentials, `MUSIC_PATH`, `OLLAMA_URL`, model.
+  3. `docker compose up`, then `docker compose run --rm analyzer` to ingest the library.
+  4. Live end-to-end smoke: a typed vibe → a real playlist in Navidrome.
