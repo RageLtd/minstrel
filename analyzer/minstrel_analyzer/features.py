@@ -22,7 +22,8 @@ class Scalars(TypedDict):
     zero_crossing_rate: float
 
 
-FEATURE_VERSION = 3
+# 4: segment-level CLAP embeddings + per-segment zero-shot scores.
+FEATURE_VERSION = 4
 BASE_SCALARS = frozenset({"bpm", "rms_energy", "spectral_centroid"})
 N_FFT = 2048
 HOP_LENGTH = 1024

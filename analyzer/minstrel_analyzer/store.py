@@ -89,10 +89,12 @@ def upsert_features(
     track_id: int,
     scalars: dict[str, float],
     zero_shot: dict[str, float],
+    extra_values: dict[str, float] | None = None,
 ) -> None:
     extra = {
         "feature_version": FEATURE_VERSION,
         **{key: value for key, value in scalars.items() if key not in BASE_SCALARS},
+        **(extra_values or {}),
     }
     conn.execute(
         """
@@ -234,15 +236,74 @@ def recompute_novelty(conn: sqlite3.Connection) -> int:
     return len(parsed)
 
 
+def _vec_blob(embedding: np.ndarray) -> bytes:
+    """Little-endian float32 — byte-identical to the orchestrator's Float32Array."""
+    if embedding.shape[-1] != EMBED_DIM:
+        raise ValueError(f"embedding must be {EMBED_DIM} dims, got {embedding.shape}")
+    return np.asarray(embedding, dtype="<f4").tobytes()
+
+
 def set_embedding(
     conn: sqlite3.Connection, track_id: int, embedding: np.ndarray
 ) -> None:
-    """vec0 has no UPSERT, so replace by primary key. Stored as little-endian
-    float32 — byte-identical to the orchestrator's Float32Array."""
-    if embedding.shape[-1] != EMBED_DIM:
-        raise ValueError(f"embedding must be {EMBED_DIM} dims, got {embedding.shape}")
-    blob = np.asarray(embedding, dtype="<f4").tobytes()
+    """vec0 has no UPSERT, so replace by primary key."""
+    blob = _vec_blob(embedding)
     conn.execute("DELETE FROM track_vec WHERE track_id = ?", (track_id,))
     conn.execute(
         "INSERT INTO track_vec(track_id, embedding) VALUES (?, ?)", (track_id, blob)
     )
+
+
+# (start_s, end_s, zero-shot scores keyed by zs_* column) for one window.
+Segment = tuple[float, float, dict[str, float]]
+
+
+def replace_segments(
+    conn: sqlite3.Connection,
+    track_id: int,
+    segments: list[Segment],
+    embeddings: np.ndarray,
+) -> None:
+    """Replace a track's segment rows and vectors wholesale.
+
+    vec0 cannot cascade, so the old segment ids are collected and deleted from
+    segment_vec explicitly before the rows go.
+    """
+    if len(segments) != len(embeddings):
+        raise ValueError(
+            f"{len(segments)} segments but {len(embeddings)} embeddings "
+            f"for track {track_id}"
+        )
+    old_ids = [
+        row[0]
+        for row in conn.execute(
+            "SELECT id FROM track_segments WHERE track_id = ?", (track_id,)
+        )
+    ]
+    conn.executemany(
+        "DELETE FROM segment_vec WHERE segment_id = ?", [(i,) for i in old_ids]
+    )
+    conn.execute("DELETE FROM track_segments WHERE track_id = ?", (track_id,))
+    for (start_s, end_s, zero_shot), embedding in zip(
+        segments, embeddings, strict=True
+    ):
+        row = conn.execute(
+            """
+            INSERT INTO track_segments
+              (track_id, start_s, end_s, zs_aggressive, zs_danceable, zs_acoustic)
+            VALUES (?, ?, ?, ?, ?, ?)
+            RETURNING id
+            """,
+            (
+                track_id,
+                start_s,
+                end_s,
+                zero_shot.get("zs_aggressive"),
+                zero_shot.get("zs_danceable"),
+                zero_shot.get("zs_acoustic"),
+            ),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO segment_vec(segment_id, embedding) VALUES (?, ?)",
+            (int(row[0]), _vec_blob(embedding)),
+        )

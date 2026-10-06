@@ -5,19 +5,29 @@ import {
   featureDistributions,
   searchTracks,
   searchableTrackCount,
-  type FeatureDistributions,
   type PreferenceFeature,
   type SearchHit,
 } from "./repo";
 import type { EmbedText } from "./embedder";
+import {
+  DECISION_OVERFETCH,
+  makeMembershipGate,
+  type MembershipGate,
+} from "./membership";
+import {
+  rerankByPreferences,
+  satisfiesPercentileConstraints,
+  satisfiesTempoConstraints,
+  type BaseCandidate,
+} from "./search-rank";
 import type {
   FeaturePercentileConstraint,
-  SearchConstraint,
-  SearchPreference,
   SearchQuery,
   TempoConstraint,
 } from "./tools";
 import { meanNormalize } from "./vec";
+
+export type { BaseCandidate } from "./search-rank";
 
 export interface SearchResult {
   hits: SearchHit[];
@@ -36,8 +46,16 @@ export interface SearchDiagnostics {
   preferenceReranked: boolean;
   diversityBackfilled: number;
   exhaustedCorpus: boolean;
+  /** Candidates the decision model judged; 0 when no gate is configured. */
+  classifierEvaluated: number;
+  classifierRejected: number;
   warnings: string[];
-  shortfallReason?: "constraints" | "exclusions" | "corpus" | "strictArtistCap";
+  shortfallReason?:
+    | "constraints"
+    | "exclusions"
+    | "classifier"
+    | "corpus"
+    | "strictArtistCap";
 }
 
 interface RankedCandidate {
@@ -45,11 +63,6 @@ interface RankedCandidate {
   bestSeedRank?: number;
   semanticRank?: number;
   insertionOrder: number;
-}
-
-export interface BaseCandidate {
-  hit: SearchHit;
-  baseScore: number;
 }
 
 const SEMANTIC_TIEBREAK_WEIGHT = 0.5;
@@ -158,117 +171,6 @@ export function fuseSearches(
     .map(({ candidate, baseScore }) => ({ hit: candidate.hit, baseScore }));
 }
 
-export function percentileRank(sorted: number[], value: number): number | undefined {
-  if (sorted.length === 0) return undefined;
-  if (sorted.length === 1) return 0.5;
-  let lower = 0;
-  let upper = sorted.length;
-  while (lower < upper) {
-    const middle = Math.floor((lower + upper) / 2);
-    if (sorted[middle]! < value) lower = middle + 1;
-    else upper = middle;
-  }
-  const first = lower;
-  upper = sorted.length;
-  while (lower < upper) {
-    const middle = Math.floor((lower + upper) / 2);
-    if (sorted[middle]! <= value) lower = middle + 1;
-    else upper = middle;
-  }
-  const last = lower - 1;
-  const averageRank = first <= last ? (first + last) / 2 : first;
-  return Math.min(1, Math.max(0, averageRank / (sorted.length - 1)));
-}
-
-const STRENGTH_WEIGHT = {
-  subtle: 0.35,
-  normal: 0.65,
-  strong: 1,
-} as const;
-
-const FEATURE_GROUP: Record<PreferenceFeature, string> = {
-  tempo: "motion",
-  energy: "motion",
-  aggression: "motion",
-  danceability: "motion",
-  acousticness: "production",
-  novelty: "novelty",
-  rhythmicIrregularity: "rhythm",
-  timbralComplexity: "texture",
-  dynamicContrast: "texture",
-  harmonicInstability: "texture",
-};
-
-function preferenceFit(
-  hit: SearchHit,
-  preferences: SearchPreference[],
-  distributions: FeatureDistributions,
-): number {
-  const groups = new Map<
-    string,
-    { weightedFit: number; totalWeight: number; groupWeight: number }
-  >();
-  for (const preference of preferences) {
-    const value = hit.featureValues[preference.feature];
-    if (value === undefined) continue;
-    const percentile = percentileRank(distributions[preference.feature], value);
-    if (percentile === undefined) continue;
-    const fit = preference.direction === "higher" ? percentile : 1 - percentile;
-    const weight = STRENGTH_WEIGHT[preference.strength];
-    const group = FEATURE_GROUP[preference.feature];
-    const aggregate = groups.get(group) ?? {
-      weightedFit: 0,
-      totalWeight: 0,
-      groupWeight: 0,
-    };
-    aggregate.weightedFit += fit * weight;
-    aggregate.totalWeight += weight;
-    aggregate.groupWeight = Math.max(aggregate.groupWeight, weight);
-    groups.set(group, aggregate);
-  }
-  if (groups.size === 0) return 0.5;
-  let weightedFit = 0;
-  let totalWeight = 0;
-  for (const aggregate of groups.values()) {
-    weightedFit +=
-      (aggregate.weightedFit / aggregate.totalWeight) * aggregate.groupWeight;
-    totalWeight += aggregate.groupWeight;
-  }
-  return weightedFit / totalWeight;
-}
-
-export function rerankByPreferences(
-  candidates: BaseCandidate[],
-  preferences: SearchPreference[],
-  distributions: FeatureDistributions,
-  requestedCount: number,
-): SearchHit[] {
-  if (preferences.length === 0 || candidates.length < 2) {
-    return candidates.map(({ hit }) => hit);
-  }
-  const lastRank = candidates.length - 1;
-  const boundaryRank = Math.min(Math.max(requestedCount - 1, 0), lastRank);
-  const outerRank = Math.min(Math.max(requestedCount * 2 - 1, 0), lastRank);
-  const relevanceGap = Math.max(
-    0,
-    candidates[outerRank]!.baseScore - candidates[boundaryRank]!.baseScore,
-  );
-  const strength = Math.max(
-    ...preferences.map((preference) => STRENGTH_WEIGHT[preference.strength]),
-  );
-  const preferenceBudget = strength * relevanceGap;
-  return candidates
-    .map((candidate, index) => {
-      const score =
-        candidate.baseScore +
-        preferenceBudget *
-          (1 - preferenceFit(candidate.hit, preferences, distributions));
-      return { hit: candidate.hit, score, index };
-    })
-    .sort((a, b) => a.score - b.score || a.index - b.index)
-    .map(({ hit }) => hit);
-}
-
 const DERIVED_FEATURES = new Set<PreferenceFeature>([
   "novelty",
   "rhythmicIrregularity",
@@ -277,50 +179,21 @@ const DERIVED_FEATURES = new Set<PreferenceFeature>([
   "harmonicInstability",
 ]);
 
-function satisfiesTempoConstraints(
-  hit: SearchHit,
-  constraints: TempoConstraint[],
-): boolean {
-  const tempo = hit.featureValues.tempo;
-  if (constraints.length > 0 && tempo === undefined) return false;
-  return constraints.every((constraint) =>
-    constraint.operator === "min"
-      ? tempo! >= constraint.value
-      : tempo! <= constraint.value,
-  );
-}
-
-function satisfiesPercentileConstraints(
-  hit: SearchHit,
-  constraints: FeaturePercentileConstraint[],
-  distributions: FeatureDistributions,
-): boolean {
-  return constraints.every((constraint) => {
-    const value = hit.featureValues[constraint.percentileFeature];
-    if (value === undefined) return false;
-    const percentile = percentileRank(
-      distributions[constraint.percentileFeature],
-      value,
-    );
-    if (percentile === undefined) return false;
-    return constraint.operator === "min"
-      ? percentile >= constraint.value
-      : percentile <= constraint.value;
-  });
-}
-
 /**
  * Turn a validated SearchQuery into ranked tracks. Searches each seed-artist
  * centroid and the CLAP-embedded semantic text independently, fuses those
  * neighborhoods, then applies validated constraints, percentile preferences,
  * adaptive retrieval, and artist diversity with cardinality backfill.
  * Missing seed artists are reported and fall through to the semantic text.
+ * With a membership gate, a decision model then judges the top candidates and
+ * only tracks it accepts reach the final selection.
  */
 export async function executeSearch(
   db: Database,
   embedText: EmbedText,
   query: SearchQuery,
-): Promise<SearchResult> {
+  gate?: MembershipGate,
+) {
   const seedQueries: Float32Array[] = [];
   const missingSeedArtists: string[] = [];
 
@@ -340,7 +213,7 @@ export async function executeSearch(
   const searchableTracks = searchableTrackCount(db);
   const warnings = [...query.warnings];
   if (seedQueries.length === 0 && !semanticQuery) {
-    return {
+    const nothingToSearch: SearchResult = {
       hits: [],
       missingSeedArtists,
       diagnostics: {
@@ -353,10 +226,13 @@ export async function executeSearch(
         preferenceReranked: false,
         diversityBackfilled: 0,
         exhaustedCorpus: true,
+        classifierEvaluated: 0,
+        classifierRejected: 0,
         warnings,
         shortfallReason: "corpus",
       },
     };
+    return nothingToSearch;
   }
 
   const excludedArtists = new Set(
@@ -395,7 +271,7 @@ export async function executeSearch(
     : undefined;
 
   if (searchableTracks === 0) {
-    return {
+    const emptyLibrary: SearchResult = {
       hits: [],
       missingSeedArtists,
       diagnostics: {
@@ -408,10 +284,13 @@ export async function executeSearch(
         preferenceReranked: false,
         diversityBackfilled: 0,
         exhaustedCorpus: true,
+        classifierEvaluated: 0,
+        classifierRejected: 0,
         warnings,
         shortfallReason: "corpus",
       },
     };
+    return emptyLibrary;
   }
 
   let neighborCount = Math.min(
@@ -422,7 +301,11 @@ export async function executeSearch(
   let finalCandidates: BaseCandidate[] = [];
   let finalAfterExclusions: BaseCandidate[] = [];
   let finalEligible: BaseCandidate[] = [];
+  let finalAdmitted: SearchHit[] = [];
   let finalSelection: DiversityResult = { hits: [], backfilled: 0 };
+  const membership = gate ? makeMembershipGate(db, gate) : undefined;
+  let classifierEvaluated = 0;
+  let classifierRejected = 0;
 
   while (true) {
     retrievalPasses += 1;
@@ -453,15 +336,27 @@ export async function executeSearch(
           requested,
         )
       : finalEligible.map(({ hit }) => hit);
+    finalAdmitted = ranked;
+    if (membership) {
+      const gated = await membership(ranked, requested);
+      finalAdmitted = gated.kept;
+      classifierEvaluated = gated.evaluated;
+      classifierRejected = gated.rejected;
+    }
     finalSelection = selectWithArtistVariety(
-      ranked,
+      finalAdmitted,
       requested,
       query.selection.artistVariety,
       query.selection.strictArtistCap,
     );
+    // With a gate, a full over-fetch window is the most the model will judge;
+    // wider retrieval cannot admit more, so stop rather than re-judge.
+    const gateWindowFull =
+      membership !== undefined && ranked.length >= requested * DECISION_OVERFETCH;
     if (
       finalSelection.hits.length >= requested ||
-      neighborCount >= searchableTracks
+      neighborCount >= searchableTracks ||
+      gateWindowFull
     ) {
       break;
     }
@@ -499,6 +394,8 @@ export async function executeSearch(
       finalAfterExclusions.length < finalCandidates.length
     ) {
       shortfallReason = "exclusions";
+    } else if (classifierRejected > 0 && finalAdmitted.length < requested) {
+      shortfallReason = "classifier";
     } else if (
       query.selection.strictArtistCap !== undefined &&
       finalSelection.hits.length < finalEligible.length
@@ -521,6 +418,8 @@ export async function executeSearch(
       preferenceReranked: rerankedPreferences.length > 0,
       diversityBackfilled: finalSelection.backfilled,
       exhaustedCorpus,
+      classifierEvaluated,
+      classifierRejected,
       warnings,
       shortfallReason,
     },

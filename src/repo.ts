@@ -39,7 +39,27 @@ export type FeatureDistributions = Record<PreferenceFeature, number[]>;
 
 // Keep this in lockstep with analyzer/minstrel_analyzer/features.py. Queries
 // ignore a partial backfill rather than comparing incompatible feature scales.
-export const AUDIO_FEATURE_VERSION = 3;
+export const AUDIO_FEATURE_VERSION = 4;
+
+/**
+ * Segment neighbours fetched per requested track. Neighbouring windows of one
+ * track cluster together, so the segment KNN must over-fetch to surface enough
+ * distinct tracks; the adaptive loop in search.ts widens further if needed.
+ */
+const SEGMENT_OVERSAMPLE = 8;
+
+/** Group → ranked (tag, probability) pairs, as analyzer/tags.py stores them. */
+export type SegmentTags = Record<string, [string, number][]>;
+
+export interface SegmentInput {
+  startS: number;
+  endS: number;
+  embedding: Float32Array;
+  tags?: SegmentTags;
+}
+
+/** Mirrors TAG_VERSION in analyzer/minstrel_analyzer/tags.py. */
+export const TAG_VERSION = 1;
 
 export interface SearchHit {
   id: number;
@@ -47,7 +67,12 @@ export interface SearchHit {
   title: string | null;
   artist: string | null;
   album: string | null;
+  /** Cosine distance of the track's closest segment to the query. */
   distance: number;
+  /** The passage that produced `distance`, when retrieval was segment-based. */
+  bestSegment?: { startS: number; endS: number };
+  /** Decision model's probability that the track belongs, once gated. */
+  membership?: number;
   featureValues: FeatureValues;
 }
 
@@ -141,35 +166,99 @@ export function setEmbedding(
 }
 
 /**
- * k nearest tracks to a query embedding. Constraints are applied after fusion so
- * diagnostics can distinguish retrieval from eligibility.
+ * Replace a track's analysed windows wholesale. vec0 cannot cascade, so the
+ * old segment vectors are deleted by id before the rows go.
+ */
+export function replaceSegments(
+  db: Database,
+  trackId: number,
+  segments: SegmentInput[],
+) {
+  db.transaction(() => {
+    const old = db
+      .query(`SELECT id FROM track_segments WHERE track_id = ?`)
+      .all(trackId) as { id: number }[];
+    const deleteVector = db.query(`DELETE FROM segment_vec WHERE segment_id = ?`);
+    for (const { id } of old) deleteVector.run(id);
+    db.query(`DELETE FROM track_segments WHERE track_id = ?`).run(trackId);
+
+    const insertRow = db.query(
+      `INSERT INTO track_segments (track_id, start_s, end_s, tags_json, tag_version)
+       VALUES (?, ?, ?, ?, ?)
+       RETURNING id`,
+    );
+    const insertVector = db.query(
+      `INSERT INTO segment_vec(segment_id, embedding) VALUES (?, ?)`,
+    );
+    for (const segment of segments) {
+      const row = insertRow.get(
+        trackId,
+        segment.startS,
+        segment.endS,
+        segment.tags ? JSON.stringify(segment.tags) : null,
+        segment.tags ? TAG_VERSION : null,
+      ) as { id: number };
+      insertVector.run(row.id, segment.embedding);
+    }
+  })();
+}
+
+function segmentCount(db: Database) {
+  const row = db.query(`SELECT count(*) AS n FROM track_segments`).get() as {
+    n: number;
+  };
+  return row.n;
+}
+
+/**
+ * k nearest tracks to a query embedding, where a track's distance is that of
+ * its closest segment — so a track qualifies on any passage, not on a crop or
+ * a centroid. Asking for every track searches every segment, which keeps the
+ * adaptive loop's "corpus exhausted" condition truthful. Constraints are
+ * applied after fusion so diagnostics can distinguish retrieval from
+ * eligibility.
  */
 export function searchTracks(
   db: Database,
   query: Float32Array,
   k: number,
   includeFeatureValues = false,
-): SearchHit[] {
+) {
   const featureColumns = includeFeatureValues
     ? `,\n           ${Object.entries(FEATURE_EXPRESSIONS)
         .map(([name, expression]) => `${expression} AS ${name}`)
         .join(",\n           ")}`
     : "";
+  const segments = segmentCount(db);
+  const segmentK =
+    k >= searchableTrackCount(db)
+      ? segments
+      : Math.min(k * SEGMENT_OVERSAMPLE, segments);
+  // SQLite's bare-column rule: with a lone min() aggregate, the other selected
+  // columns come from the row that holds the minimum — i.e. the best segment.
   const sql = `
-    SELECT t.id, t.navidrome_id AS navidromeId, t.title, t.artist, t.album, v.distance${featureColumns}
-      FROM track_vec v
-      JOIN tracks t ON t.id = v.track_id
-      JOIN track_features f ON f.track_id = v.track_id
-     WHERE v.embedding MATCH ? AND k = ?
-     ORDER BY v.distance, t.id
+    WITH nearest AS (
+      SELECT segment_id, distance
+        FROM segment_vec
+       WHERE embedding MATCH ? AND k = ?
+    )
+    SELECT t.id, t.navidrome_id AS navidromeId, t.title, t.artist, t.album,
+           min(n.distance) AS distance,
+           s.start_s AS segmentStartS, s.end_s AS segmentEndS${featureColumns}
+      FROM nearest n
+      JOIN track_segments s ON s.id = n.segment_id
+      JOIN tracks t ON t.id = s.track_id
+      JOIN track_features f ON f.track_id = t.id
+     GROUP BY t.id
+     ORDER BY distance, t.id
      LIMIT ?`;
 
-  type SearchRow = Omit<SearchHit, "featureValues"> &
-    Record<PreferenceFeature, number | null>;
-  const rows = db
-    .query(sql)
-    .all(query, k, k) as SearchRow[];
-  return rows.map((row) => {
+  type SearchRow = Omit<SearchHit, "featureValues" | "bestSegment"> & {
+    segmentStartS: number;
+    segmentEndS: number;
+  } & Record<PreferenceFeature, number | null>;
+  const rows = db.query(sql).all(query, Math.max(segmentK, 1), k) as SearchRow[];
+  const hits: SearchHit[] = rows.map((row) => {
     const featureValues: FeatureValues = {};
     for (const name of Object.keys(FEATURE_EXPRESSIONS) as PreferenceFeature[]) {
       const value = row[name];
@@ -188,10 +277,17 @@ export function searchTracks(
       timbralComplexity,
       dynamicContrast,
       harmonicInstability,
+      segmentStartS,
+      segmentEndS,
       ...hit
     } = row;
-    return { ...hit, featureValues };
+    return {
+      ...hit,
+      bestSegment: { startS: segmentStartS, endS: segmentEndS },
+      featureValues,
+    };
   });
+  return hits;
 }
 
 export function searchableTrackCount(db: Database): number {

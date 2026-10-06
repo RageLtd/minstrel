@@ -38,5 +38,6 @@ test("schema creates tracks, features, and analysis metadata tables", () => {
   expect(set.has("tracks")).toBe(true);
   expect(set.has("track_features")).toBe(true);
   expect(set.has("analysis_meta")).toBe(true);
+  expect(set.has("track_segments")).toBe(true);
   db.close();
 });

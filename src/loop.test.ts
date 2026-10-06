@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, toEmbedding, EMBED_DIM } from "./db";
-import { upsertTrack, upsertFeatures, setEmbedding } from "./repo";
+import { upsertTrack, upsertFeatures, setEmbedding, replaceSegments } from "./repo";
 import { handleMessage, TRANSLATION_TEMPERATURE } from "./loop";
 import {
   type ChatOptions,
@@ -24,6 +24,7 @@ function seed(db: ReturnType<typeof openDb>, artist: string, emb: Float32Array):
   });
   upsertFeatures(db, id, { rmsEnergy: 0.5, bpm: 120 });
   setEmbedding(db, id, emb);
+  replaceSegments(db, id, [{ startS: 0, endS: 10, embedding: emb }]);
   return id;
 }
 

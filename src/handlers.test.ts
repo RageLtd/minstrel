@@ -1,6 +1,6 @@
 import { test, expect } from "bun:test";
 import { openDb, toEmbedding, EMBED_DIM } from "./db";
-import { upsertTrack, upsertFeatures, setEmbedding } from "./repo";
+import { upsertTrack, upsertFeatures, setEmbedding, replaceSegments } from "./repo";
 import { chatHandler, playlistHandler } from "./handlers";
 import type { OllamaChatResponse, chatWithTools } from "./ollama";
 import type { NavidromeClient } from "./navidrome";
@@ -15,6 +15,7 @@ function seed(db: ReturnType<typeof openDb>, artist: string): void {
   const id = upsertTrack(db, { navidromeId: `nav-${artist}`, title: `${artist} song`, artist });
   upsertFeatures(db, id, { rmsEnergy: 0.5, bpm: 120 });
   setEmbedding(db, id, basis([0, 1]));
+  replaceSegments(db, id, [{ startS: 0, endS: 10, embedding: basis([0, 1]) }]);
 }
 
 function queuedChat(responses: OllamaChatResponse[]): typeof chatWithTools {

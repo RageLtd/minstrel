@@ -1,7 +1,7 @@
 import numpy as np
 
 from minstrel_analyzer import features
-from minstrel_analyzer.clap import CLAP_SR, EMBED_DIM, Clap
+from minstrel_analyzer.clap import CLAP_SR, EMBED_DIM, Clap, segment_windows
 
 
 def _noise(seconds: float = 3.0) -> np.ndarray:
@@ -84,3 +84,24 @@ def test_librosa_features_handle_very_short_audio():
     short = np.random.default_rng(2).normal(0, 0.1, 2048).astype(np.float32)
 
     assert all(np.isfinite(value) for value in features.extract(short).values())
+
+
+def test_segment_windows_tile_long_audio_with_a_tail_aligned_final_window():
+    sr = CLAP_SR
+    assert segment_windows(23 * sr, sr) == [
+        (0, 10 * sr),
+        (5 * sr, 15 * sr),
+        (10 * sr, 20 * sr),
+        (13 * sr, 23 * sr),
+    ]
+
+
+def test_segment_windows_drop_a_tail_shorter_than_the_minimum():
+    sr = CLAP_SR
+    assert segment_windows(12 * sr, sr) == [(0, 10 * sr)]
+
+
+def test_segment_windows_keep_short_audio_as_one_window():
+    sr = CLAP_SR
+    assert segment_windows(4 * sr, sr) == [(0, 4 * sr)]
+    assert segment_windows(10 * sr, sr) == [(0, 10 * sr)]

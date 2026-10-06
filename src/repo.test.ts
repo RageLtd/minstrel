@@ -4,6 +4,7 @@ import {
   upsertTrack,
   upsertFeatures,
   setEmbedding,
+  replaceSegments,
   searchTracks,
   featureDistributions,
 } from "./repo";
@@ -28,6 +29,7 @@ function seedTrack(
   });
   upsertFeatures(db, id, { rmsEnergy: energy, bpm });
   setEmbedding(db, id, embedding);
+  replaceSegments(db, id, [{ startS: 0, endS: 10, embedding }]);
   return id;
 }
 
@@ -51,6 +53,46 @@ test("similarity search orders by distance", () => {
 
   const hits = searchTracks(db, basis([0, 1]), 3);
   expect(hits.map((h) => h.id)).toEqual([t1, t2, t3]);
+  db.close();
+});
+
+test("a track matches on its best passage, not its centroid", () => {
+  const db = openDb(":memory:");
+  // Two-faced track: a dim-0 passage, then a dim-1 passage. Its centroid sits
+  // between them, so centroid search would rank the single-passage track first.
+  const twoFaced = seedTrack(db, "two-faced", basis([0, 1], [1, 1]), 0.5);
+  replaceSegments(db, twoFaced, [
+    { startS: 0, endS: 10, embedding: basis([0, 1]) },
+    { startS: 5, endS: 15, embedding: basis([1, 1]) },
+  ]);
+  const steady = seedTrack(db, "steady", basis([0, 1], [1, 0.5]), 0.5);
+
+  const hits = searchTracks(db, basis([1, 1]), 2);
+
+  expect(hits.map((hit) => hit.id)).toEqual([twoFaced, steady]);
+  expect(hits[0]!.distance).toBeCloseTo(0, 5);
+  expect(hits[0]!.bestSegment).toEqual({ startS: 5, endS: 15 });
+  expect(hits).toHaveLength(2); // one row per track, never per segment
+  db.close();
+});
+
+test("replacing segments drops the old vectors", () => {
+  const db = openDb(":memory:");
+  const id = seedTrack(db, "track", basis([0, 1]), 0.5);
+  replaceSegments(db, id, [
+    { startS: 0, endS: 10, embedding: basis([0, 1]) },
+    { startS: 5, endS: 15, embedding: basis([1, 1]) },
+  ]);
+  replaceSegments(db, id, [{ startS: 0, endS: 10, embedding: basis([2, 1]) }]);
+
+  const rows = db.query(`SELECT count(*) AS n FROM track_segments`).get() as {
+    n: number;
+  };
+  const vectors = db.query(`SELECT count(*) AS n FROM segment_vec`).get() as {
+    n: number;
+  };
+  expect(rows.n).toBe(1);
+  expect(vectors.n).toBe(1);
   db.close();
 });
 

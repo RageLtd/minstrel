@@ -21,6 +21,43 @@ transformers.logging.set_verbosity_error()
 CLAP_SR = 48_000
 EMBED_DIM = 512
 
+# The HF feature extractor silently takes ONE random 10 s crop of anything
+# longer (truncation="rand_trunc", max_length_s=10), so a whole track must be
+# tiled into windows no longer than that and embedded piecewise.
+SEGMENT_WINDOW_S = 10
+SEGMENT_HOP_S = 5
+# A leftover tail shorter than this is dropped rather than padded.
+SEGMENT_MIN_TAIL_S = 3
+
+
+def segment_windows(
+    sample_count: int,
+    sr: int = CLAP_SR,
+    *,
+    window_s: int = SEGMENT_WINDOW_S,
+    hop_s: int = SEGMENT_HOP_S,
+    min_tail_s: int = SEGMENT_MIN_TAIL_S,
+) -> list[tuple[int, int]]:
+    """[start, end) sample ranges tiling a track with fixed-length windows.
+
+    Windows advance by the hop while a full window fits. A remaining tail of at
+    least `min_tail_s` gets one final window aligned to the end of the track, so
+    every window is full-length (no padding) and the outro is never lost.
+    Audio shorter than one window is a single window.
+    """
+    window = window_s * sr
+    hop = hop_s * sr
+    if sample_count <= window:
+        return [(0, sample_count)]
+    windows: list[tuple[int, int]] = []
+    start = 0
+    while start + window <= sample_count:
+        windows.append((start, start + window))
+        start += hop
+    if sample_count - windows[-1][1] >= min_tail_s * sr:
+        windows.append((sample_count - window, sample_count))
+    return windows
+
 # Music-tuned LAION checkpoint; matches the Xenova ONNX build we'd use if the
 # worker ever moves to TypeScript, so embeddings stay comparable across both.
 DEFAULT_MODEL = os.environ.get(

@@ -9,8 +9,8 @@ from typing import NamedTuple, Protocol, TypeVar
 
 import numpy as np
 
-from . import features, store
-from .clap import Clap, pair_probability
+from . import features, store, tags
+from .clap import CLAP_SR, Clap, pair_probability, segment_windows
 from .navidrome import Navidrome, Song
 
 # Contrastive prompt pairs → calibrated 0..1 mood knobs the orchestrator filters on.
@@ -22,6 +22,8 @@ ZS_PROMPTS: dict[str, tuple[str, str]] = {
 
 PREPARE_WORKERS = 8
 AUDIO_BATCH_SIZE = 8
+# Windows per GPU call; a song batch's windows are flattened and chunked by this.
+SEGMENT_BATCH_SIZE = 32
 T = TypeVar("T")
 
 
@@ -34,11 +36,38 @@ class PreparedSong(NamedTuple):
     song: Song
     audio: np.ndarray
     scalars: features.Scalars
+    windows: list[tuple[int, int]]
 
 
 def _prepare_song(source: SongSource, song: Song) -> PreparedSong:
     audio = features.load_audio_bytes(source.download(song["id"]))
-    return PreparedSong(song, audio, features.extract(audio))
+    return PreparedSong(
+        song, audio, features.extract(audio), segment_windows(len(audio))
+    )
+
+
+def _embed_segments(
+    clap: Clap, batch: list[PreparedSong], segment_batch_size: int
+) -> list[np.ndarray]:
+    """Per-song [n_windows, 512] embeddings for a batch of prepared songs."""
+    windows = [
+        item.audio[start:end] for item in batch for start, end in item.windows
+    ]
+    chunks = [
+        clap.embed_audio_batch(chunk)
+        for chunk in _batches(windows, segment_batch_size)
+    ]
+    flat = (
+        np.concatenate(chunks)
+        if chunks
+        else np.empty((0, store.EMBED_DIM), dtype=np.float32)
+    )
+    per_song: list[np.ndarray] = []
+    offset = 0
+    for item in batch:
+        per_song.append(flat[offset : offset + len(item.windows)])
+        offset += len(item.windows)
+    return per_song
 
 
 def _iter_prepared(
@@ -93,14 +122,34 @@ def _embed_zero_shot_prompts(clap: Clap) -> dict[str, np.ndarray]:
 def _store_analysis(
     conn: sqlite3.Connection,
     prepared: PreparedSong,
-    embedding: np.ndarray,
+    segment_embeddings: np.ndarray,
     prompt_embeddings: dict[str, np.ndarray],
 ) -> int:
+    """Persist one track: per-segment vectors and mood scores, plus a track-level
+    centroid and the mean/min/max of each mood score across segments."""
     song = prepared.song
-    zero_shot = {
-        column: pair_probability(embedding, text_pair)
-        for column, text_pair in prompt_embeddings.items()
+    segments: list[store.Segment] = []
+    for (start, end), embedding in zip(
+        prepared.windows, segment_embeddings, strict=True
+    ):
+        zero_shot = {
+            column: pair_probability(embedding, text_pair)
+            for column, text_pair in prompt_embeddings.items()
+        }
+        segments.append((start / CLAP_SR, end / CLAP_SR, zero_shot))
+
+    track_zero_shot = {
+        column: float(np.mean([zero_shot[column] for _, _, zero_shot in segments]))
+        for column in prompt_embeddings
     }
+    spread = {
+        f"{column}_{bound}": float(reduce(zero_shot[column] for _, _, zero_shot in segments))
+        for column in prompt_embeddings
+        for bound, reduce in (("min", min), ("max", max))
+    }
+    centroid = np.mean(segment_embeddings, axis=0)
+    centroid = centroid / max(float(np.linalg.norm(centroid)), 1e-12)
+
     track_id = store.upsert_track(
         conn,
         navidrome_id=song["id"],
@@ -110,8 +159,15 @@ def _store_analysis(
         album=song["album"],
         nav_size=song["size"],
     )
-    store.upsert_features(conn, track_id, prepared.scalars, zero_shot)
-    store.set_embedding(conn, track_id, embedding)
+    store.upsert_features(
+        conn,
+        track_id,
+        prepared.scalars,
+        track_zero_shot,
+        {"segment_count": len(segments), **spread},
+    )
+    store.set_embedding(conn, track_id, centroid.astype(np.float32))
+    store.replace_segments(conn, track_id, segments, segment_embeddings)
     conn.commit()
     return track_id
 
@@ -132,9 +188,9 @@ def analyze_song(
     store.mark_audio_features_stale(conn)
     conn.commit()
     prepared = _prepare_song(source, song)
-    embedding = clap.embed_audio(prepared.audio)
+    embeddings = _embed_segments(clap, [prepared], SEGMENT_BATCH_SIZE)[0]
     track_id = _store_analysis(
-        conn, prepared, embedding, _embed_zero_shot_prompts(clap)
+        conn, prepared, embeddings, _embed_zero_shot_prompts(clap)
     )
     store.recompute_novelty(conn)
     conn.commit()
@@ -148,6 +204,7 @@ def sync(
     *,
     workers: int = PREPARE_WORKERS,
     batch_size: int = AUDIO_BATCH_SIZE,
+    segment_batch_size: int = SEGMENT_BATCH_SIZE,
 ) -> int:
     analyzed = 0
     was_ready = store.audio_features_ready(conn)
@@ -164,13 +221,14 @@ def sync(
     for batch in _batches(prepared, batch_size):
         if prompt_embeddings is None:
             prompt_embeddings = _embed_zero_shot_prompts(clap)
-        embeddings = clap.embed_audio_batch([item.audio for item in batch])
-        for item, embedding in zip(batch, embeddings, strict=True):
-            _store_analysis(conn, item, embedding, prompt_embeddings)
+        embeddings = _embed_segments(clap, batch, segment_batch_size)
+        for item, item_embeddings in zip(batch, embeddings, strict=True):
+            _store_analysis(conn, item, item_embeddings, prompt_embeddings)
             analyzed += 1
     if analyzed > 0 or store.novelty_needs_recompute(conn):
         store.recompute_novelty(conn)
         conn.commit()
+    tags.retag(conn, clap)
     if analyzed > 0 or was_ready or store.all_stored_features_current(conn):
         store.mark_audio_features_ready(conn)
         conn.commit()

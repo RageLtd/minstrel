@@ -1,93 +1,23 @@
 import { test, expect } from "bun:test";
-import { openDb, toEmbedding, EMBED_DIM } from "./db";
+import { openDb } from "./db";
+import { AUDIO_FEATURE_VERSION, upsertFeatures } from "./repo";
+import { executeSearch, fuseSearches, selectWithArtistVariety } from "./search";
 import {
-  AUDIO_FEATURE_VERSION,
-  upsertTrack,
-  upsertFeatures,
-  setEmbedding,
-} from "./repo";
-import type { SearchHit } from "./repo";
-import {
-  executeSearch,
-  fuseSearches,
   percentileRank,
   rerankByPreferences,
-  selectWithArtistVariety,
   type BaseCandidate,
-} from "./search";
-import type { SearchQuery } from "./tools";
-
-function basis(...pairs: [number, number][]): Float32Array {
-  const v = new Array<number>(EMBED_DIM).fill(0);
-  for (const [i, val] of pairs) v[i] = val;
-  return toEmbedding(v);
-}
-
-function seed(
-  db: ReturnType<typeof openDb>,
-  path: string,
-  artist: string,
-  emb: Float32Array,
-  extra?: Record<string, number>,
-): number {
-  const id = upsertTrack(db, {
-    navidromeId: path,
-    title: path,
-    artist,
-  });
-  upsertFeatures(db, id, {
-    rmsEnergy: 0.5,
-    bpm: 120,
-    extra: extra ? { feature_version: AUDIO_FEATURE_VERSION, ...extra } : undefined,
-  });
-  setEmbedding(db, id, emb);
-  return id;
-}
+} from "./search-rank";
+import {
+  basis,
+  fakeHit,
+  markAudioFeaturesReady,
+  query,
+  seed,
+} from "./test-fixtures";
 
 const noEmbed = async (): Promise<Float32Array> => {
   throw new Error("embedText should not be called");
 };
-
-function fakeHit(id: number): SearchHit {
-  return {
-    id,
-    navidromeId: String(id),
-    title: String(id),
-    artist: String(id),
-    album: null,
-    distance: 0,
-    featureValues: {},
-  };
-}
-
-type QueryOverrides = Omit<Partial<SearchQuery>, "selection"> & {
-  selection?: Partial<SearchQuery["selection"]>;
-};
-
-function query(overrides: QueryOverrides = {}): SearchQuery {
-  const { selection, ...rest } = overrides;
-  return {
-    version: 2,
-    semanticText: "",
-    constraints: [],
-    preferences: [],
-    selection: {
-      count: 30,
-      artistVariety: "balanced",
-      ...selection,
-    },
-    warnings: [],
-    ...rest,
-  };
-}
-
-function markAudioFeaturesReady(db: ReturnType<typeof openDb>): void {
-  db.query(
-    `INSERT INTO analysis_meta (key, value)
-     VALUES ('audio_feature_version', ?)
-     ON CONFLICT(key) DO UPDATE SET value=excluded.value`,
-  ).run(AUDIO_FEATURE_VERSION);
-}
 
 test("seed artist (case-insensitive) drives the search", async () => {
   const db = openDb(":memory:");
@@ -460,6 +390,40 @@ test("adaptive retrieval expands until explicit constraints can fill the request
   expect(hits).toHaveLength(5);
   expect(diagnostics.retrievalPasses).toBe(2);
   expect(diagnostics.exhaustedCorpus).toBe(true);
+  db.close();
+});
+
+test("the membership gate removes rejected tracks and names itself as the shortfall", async () => {
+  const db = openDb(":memory:");
+  const keep = seed(db, "keep", "Keep", basis([0, 1]));
+  const reject = seed(db, "reject", "Reject", basis([0, 1], [1, 0.01]));
+  const alsoKeep = seed(db, "also", "Also", basis([0, 1], [1, 0.02]));
+  const judged: string[] = [];
+
+  const { hits, diagnostics } = await executeSearch(
+    db,
+    async () => basis([0, 1]),
+    query({ semanticText: "doom", selection: { count: 3 } }),
+    {
+      requestText: "slow crushing doom",
+      decide: async (requestText, candidates) => {
+        judged.push(requestText);
+        return new Map(
+          candidates.map((candidate) => [candidate.id, candidate.id === reject ? 0.1 : 0.9]),
+        );
+      },
+    },
+  );
+
+  expect(hits.map((hit) => hit.id)).toEqual([keep, alsoKeep]);
+  expect(hits.map((hit) => hit.membership)).toEqual([0.9, 0.9]);
+  expect(judged).toEqual(["slow crushing doom"]);
+  expect(diagnostics).toMatchObject({
+    returned: 2,
+    classifierEvaluated: 3,
+    classifierRejected: 1,
+    shortfallReason: "classifier",
+  });
   db.close();
 });
 

@@ -18,6 +18,7 @@ import {
   type SearchDiagnostics,
   type SearchResult,
 } from "./search";
+import type { DecideMembership } from "./decider";
 import type { EmbedText } from "./embedder";
 import type { SearchHit } from "./repo";
 
@@ -45,6 +46,8 @@ export interface HandleDeps {
   /** Injectable for tests; defaults to the real Ollama client. */
   chat?: typeof chatWithTools;
   chatOptions?: ChatOptions;
+  /** Membership decision model; omitted means results are not gated. */
+  decide?: DecideMembership;
 }
 
 /** Compact, vector-free result facts for the narration turn. */
@@ -76,6 +79,8 @@ function resultReply(result: SearchResult): string {
         ? "No tracks satisfied the explicit constraints."
         : result.diagnostics.shortfallReason === "exclusions"
           ? "No tracks remained after the requested exclusions."
+        : result.diagnostics.shortfallReason === "classifier"
+          ? "The decision model judged that no candidate belongs on this playlist."
         : "No tracks matched that search.";
     return `${reason}${missingSuffix}`;
   }
@@ -103,6 +108,8 @@ function resultReply(result: SearchResult): string {
       ? " Explicit constraints limited the result."
       : result.diagnostics.shortfallReason === "exclusions"
         ? " Requested exclusions limited the result."
+      : result.diagnostics.shortfallReason === "classifier"
+        ? " The decision model rejected the other candidates."
       : result.diagnostics.shortfallReason === "strictArtistCap"
         ? " The requested per-artist cap limited the result."
         : "";
@@ -141,7 +148,12 @@ export async function handleMessage(
   }
 
   const query = parseSearchToolCall(call.args, userText);
-  const result = await executeSearch(deps.db, deps.embedText, query);
+  const result = await executeSearch(
+    deps.db,
+    deps.embedText,
+    query,
+    deps.decide ? { decide: deps.decide, requestText: userText } : undefined,
+  );
   const fallbackReply = resultReply(result);
 
   messages[0] = { role: "system", content: NARRATION_PROMPT };

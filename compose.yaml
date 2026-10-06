@@ -68,6 +68,10 @@ services:
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11434}
       MINSTREL_MODEL: ${MINSTREL_MODEL:-gemma4:26b}
       MINSTREL_THINK: ${MINSTREL_THINK:-true}
+      # Decision model served by the same Ollama (/v1/systemone); set to an
+      # empty string to skip the membership gate.
+      MINSTREL_DECISION_MODEL: ${MINSTREL_DECISION_MODEL-tev1}
+      MINSTREL_DECISION_BATCH: ${MINSTREL_DECISION_BATCH:-50}
       NAVIDROME_URL: http://navidrome:4533
       NAVIDROME_USER: ${NAVIDROME_USER:?set NAVIDROME_USER in .env}
       NAVIDROME_PASS: ${NAVIDROME_PASS:?set NAVIDROME_PASS in .env}

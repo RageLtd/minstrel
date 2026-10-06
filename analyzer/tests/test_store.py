@@ -50,7 +50,8 @@ class FakeClap:
     def embed_audio_batch(self, audio: list[np.ndarray]) -> np.ndarray:
         self.audio_batch_sizes.append(len(audio))
         embeddings = np.zeros((len(audio), 512), dtype=np.float32)
-        embeddings[:, 0] = 1.0
+        for index in range(len(audio)):
+            embeddings[index, index % 512] = 1.0  # one-hot per segment
         return embeddings
 
     def embed_text(self, texts: list[str]) -> np.ndarray:
@@ -152,5 +153,59 @@ def test_sync_batches_audio_and_embeds_fixed_prompts_once(tmp_path):
     assert analyze.sync(clap, conn, nav, workers=2, batch_size=2) == 3
 
     assert clap.audio_batch_sizes == [2, 1]
-    assert clap.text_calls == 1
+    # Once for the zero-shot prompt pairs, once for the tag vocabulary — never
+    # per song.
+    assert clap.text_calls == 2
     assert nav.downloads == 3
+
+
+def test_sync_stores_one_embedding_per_segment_and_a_track_centroid(tmp_path):
+    nav = FakeNavidrome([_song("nav-1", 1000)], _tone_bytes(secs=23.0))
+    clap = FakeClap()
+    conn = store.open_db(str(tmp_path / "m.db"))
+
+    assert analyze.sync(clap, conn, nav) == 1
+
+    segments = conn.execute(
+        "SELECT start_s, end_s, zs_aggressive FROM track_segments ORDER BY start_s"
+    ).fetchall()
+    assert [(start, end) for start, end, _ in segments] == [
+        (0.0, 10.0),
+        (5.0, 15.0),
+        (10.0, 20.0),
+        (13.0, 23.0),
+    ]
+    assert all(0.0 <= score <= 1.0 for _, _, score in segments)
+    assert conn.execute("SELECT count(*) FROM segment_vec").fetchone()[0] == 4
+    assert clap.audio_batch_sizes == [4]
+
+    # track_vec is the renormalised mean of the segment embeddings. FakeClap
+    # emits one-hot rows, so the centroid is 0.5 on each of the first four dims.
+    blob = conn.execute("SELECT embedding FROM track_vec").fetchone()[0]
+    centroid = np.frombuffer(blob, dtype="<f4")
+    np.testing.assert_allclose(centroid[:4], 0.5, atol=1e-6)
+    assert np.all(centroid[4:] == 0)
+
+    extra = json.loads(
+        conn.execute("SELECT extra_json FROM track_features").fetchone()[0]
+    )
+    assert extra["segment_count"] == 4
+    assert extra["zs_aggressive_min"] <= extra["zs_aggressive_max"]
+    track_score = conn.execute(
+        "SELECT zs_aggressive FROM track_features"
+    ).fetchone()[0]
+    assert abs(track_score - np.mean([score for _, _, score in segments])) < 1e-9
+
+
+def test_reanalysis_replaces_segments_instead_of_appending(tmp_path):
+    nav = FakeNavidrome([_song("nav-1", 1000)], _tone_bytes(secs=23.0))
+    clap = FakeClap()
+    conn = store.open_db(str(tmp_path / "m.db"))
+
+    assert analyze.sync(clap, conn, nav) == 1
+    changed = FakeNavidrome([_song("nav-1", 2000)], _tone_bytes(secs=23.0))
+    assert analyze.sync(clap, conn, changed) == 1
+
+    assert conn.execute("SELECT count(*) FROM track_segments").fetchone()[0] == 4
+    assert conn.execute("SELECT count(*) FROM segment_vec").fetchone()[0] == 4
+    assert conn.execute("SELECT count(*) FROM track_vec").fetchone()[0] == 1

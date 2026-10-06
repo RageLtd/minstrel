@@ -17,32 +17,42 @@ Two halves share one SQLite file.
 
 **Ingest** (Python, GPU) — the analyzer enumerates your library through
 Navidrome's Subsonic API, downloads each original file (never `stream`, which may
-transcode and poison the embeddings), decodes it in memory, and stores a
-512-dimensional CLAP audio embedding, three zero-shot mood scores, and librosa
-descriptors for tempo, dynamics, rhythm, timbre, and harmony. A versioned feature
-set makes ordinary re-runs incremental while automatically re-analyzing tracks
-when the extractor changes. Feature-aware reranking stays disabled until that
-backfill and corpus-novelty calibration complete, so versions are never mixed.
+transcode and poison the embeddings), decodes it in memory, and tiles it into
+10-second windows (5-second hop). Every window gets its own 512-dimensional CLAP
+audio embedding and zero-shot mood scores, so a track that moves from a clean
+intro to a blast-beat finale is stored as both, not as one random crop. Each
+window is also tagged against a fixed vocabulary of genres, moods, sounds, and
+feels (zero-shot, from the stored embedding — re-taggable without re-downloading).
+Track-level rows keep a centroid embedding, the mean/min/max of each mood score,
+and librosa descriptors for tempo, dynamics, rhythm, timbre, and harmony. A
+versioned feature set makes ordinary re-runs incremental while automatically
+re-analyzing tracks when the extractor changes.
 
 **Query** (Bun, CPU) — the orchestrator serves a chat UI. Your message goes to
 Ollama with exactly one tool, `search_tracks`; the model's arguments are
 validated into a typed query, the semantic text is embedded by the *same* CLAP
-model via the embed-server, and KNN searches over `sqlite-vec` produce an
-over-fetched candidate pool. Multiple seed artists retain independent centroids,
-so their neighborhoods are fused rather than averaged into a generic midpoint.
-Explicit numeric constraints narrow the pool; every subjective quality is a
+model via the embed-server, and KNN searches over the segment vectors in
+`sqlite-vec` produce an over-fetched candidate pool where a track scores on its
+closest passage. Multiple seed artists retain independent centroids, so their
+neighborhoods are fused rather than averaged into a generic midpoint. Explicit
+numeric constraints narrow the pool; every subjective quality is a
 corpus-percentile preference that reranks it within a bounded CLAP relevance
-window. Retrieval expands when constraints or artist diversity underfill, and
-artist-variety quotas backfill rather than silently reducing the requested count.
-One click writes the immutable result to Navidrome via `createPlaylist`.
+window. Then a **decision model** (Together AI's tev1 by default, served by your
+Ollama via `/v1/systemone`) reads a compact text card per candidate — metadata, tempo, mood
+ranges, and the tagged passage timeline — and answers "does this belong on a
+playlist for *the request*?" with a calibrated probability; tracks below the
+threshold are dropped and the shortfall is reported as such. Artist-variety
+quotas backfill rather than silently reducing the requested count. One click
+writes the immutable result to Navidrome via `createPlaylist`.
 
 ```
 chat message
   → Ollama (search_tracks tool) → validated SearchQuery
   → semantic_text  → CLAP text embedding (embed-server)
     seed_artists   → one centroid and KNN neighborhood per artist
-  → adaptive KNN over track_vec + validated hard constraints
+  → adaptive KNN over segment_vec (best passage per track) + hard constraints
   → fuse seed neighborhoods + bounded percentile-preference reranking
+  → track cards → Ollama /v1/systemone (tev1) → membership probability gate
   → artist diversity + cardinality backfill
   → grounded diagnostics → createPlaylist(name, [navidrome_id…]) → Navidrome
 ```
@@ -59,9 +69,10 @@ step, no filesystem access from the analyzer.
 | `analyzer` | Python on NGC PyTorch | batch ingest: enumerate, download, embed | yes |
 | `embed-server` | same image | CLAP text-embedding HTTP service (port 8001, internal) | yes |
 | `orchestrator` | Bun | chat UI, LLM tool-loop, search, playlist writer (port 3000) | no |
-| `ollama` | **external** | hosts the translation model — not in the Compose file | yes |
+| `ollama` | **external** | hosts the translation model and the decision model — not in the Compose file | yes |
 
 Ollama is expected to already exist on your host or LAN; point `OLLAMA_URL` at it.
+It needs v0.35.0+ for decision models (`ollama pull tev1`).
 
 ## Deploy
 
@@ -100,6 +111,8 @@ Everything is environment-driven; Compose reads `.env` automatically.
 | `OLLAMA_URL` | `http://host.docker.internal:11434` | Your existing Ollama server |
 | `MINSTREL_MODEL` | `gemma4:26b` | Ollama tag for query translation; must already be pulled |
 | `MINSTREL_THINK` | `true` | Ollama thinking channel. Keep on: reasoning-first models (GLM 5.x, qwen3.x) return empty narration without it. `false` trades reliability for latency |
+| `MINSTREL_DECISION_MODEL` | `tev1` | Ollama decision model for the membership gate; must already be pulled. Empty string disables the gate. `clef-flash` (9B) and `clef` (27B) are heavier alternatives |
+| `MINSTREL_DECISION_BATCH` | `50` | Track cards packed into one decision request (one forward pass each; Ollama caps a request at 64 questions) |
 | `NAVIDROME_PORT` | `4533` | Published port |
 | `ORCHESTRATOR_PORT` | `3000` | Published port |
 | `MINSTREL_DB` | `minstrel.db` | SQLite path (`/data/minstrel.db` in containers) |
@@ -149,14 +162,18 @@ src/
   handlers.ts                 /api/chat and /api/playlist, dependency-injected
   loop.ts                     planner call + grounded result summary
   tools.ts                    search_tracks definition, system prompt, argument validation
-  search.ts                   SearchQuery → ranked tracks
-  repo.ts                     upserts + the filtered KNN
+  search.ts                   SearchQuery → ranked tracks (retrieval, fusion, gate, diversity)
+  search-rank.ts              percentile preferences + constraint eligibility
+  membership.ts               decision-model gate over the candidate window
+  track-card.ts               per-track text card (passages from segment tags)
+  repo.ts                     upserts + segment KNN with best-passage aggregation
   db.ts                       SQLite + sqlite-vec setup
-  ollama.ts / embedder.ts / navidrome.ts   external clients
+  ollama.ts / embedder.ts / decider.ts / navidrome.ts   external clients
   frontend.ts / index.css     SolidJS chat UI (bundled via HTML import)
 analyzer/minstrel_analyzer/
   analyze.py                  ingest pipeline + CLI
-  clap.py                     CLAP audio/text embeddings + zero-shot scoring
+  clap.py                     CLAP audio/text embeddings, windowing, zero-shot scoring
+  tags.py                     tag vocabulary + per-segment zero-shot tagging (retag pass)
   features.py                 librosa descriptors for rhythm, timbre, dynamics, and harmony
   navidrome.py                Subsonic enumerate + download
   store.py                    SQLite writes

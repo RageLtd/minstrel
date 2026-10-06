@@ -81,8 +81,31 @@ test("describes execution diagnostics and warnings", () => {
       preferenceReranked: false,
       diversityBackfilled: 0,
       exhaustedCorpus: true,
+      classifierEvaluated: 12,
+      classifierRejected: 8,
       warnings: ["Dropped an invented BPM constraint."],
       shortfallReason: "constraints",
     }),
   ).toContainEqual({ label: "Result count", value: "4 of 30" });
+});
+
+test("reports the membership decision outcome", () => {
+  const base = {
+    requested: 4,
+    returned: 4,
+    searchableTracks: 10,
+    retrievalPasses: 1,
+    retrievedCandidates: 10,
+    eligibleCandidates: 10,
+    preferenceReranked: false,
+    diversityBackfilled: 0,
+    exhaustedCorpus: false,
+    warnings: [],
+  };
+  expect(
+    describeSearchDiagnostics({ ...base, classifierEvaluated: 12, classifierRejected: 8 }),
+  ).toContainEqual({ label: "Membership decision", value: "12 judged, 8 rejected" });
+  expect(
+    describeSearchDiagnostics({ ...base, classifierEvaluated: 0, classifierRejected: 0 }),
+  ).toContainEqual({ label: "Membership decision", value: "Not applied" });
 });

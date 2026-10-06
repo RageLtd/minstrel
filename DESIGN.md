@@ -62,7 +62,17 @@ CREATE TABLE track_features (track_id PK, bpm, rms_energy, spectral_centroid,
   zs_aggressive, zs_danceable, zs_acoustic, extra_json);
 CREATE TABLE analysis_meta (key TEXT PRIMARY KEY, value INTEGER NOT NULL);
 CREATE VIRTUAL TABLE track_vec USING vec0(track_id PK, embedding FLOAT[512] cosine);
+-- one row per 10 s window (5 s hop); the unit of retrieval
+CREATE TABLE track_segments (id PK, track_id, start_s, end_s,
+  zs_aggressive, zs_danceable, zs_acoustic, tags_json, tag_version);
+CREATE VIRTUAL TABLE segment_vec USING vec0(segment_id PK, embedding FLOAT[512] cosine);
 ```
+
+`track_vec` holds the renormalised mean of a track's segment embeddings and only
+serves seed-artist centroids. Matching runs over `segment_vec`. The HF CLAP feature
+extractor otherwise takes **one random 10-second crop** of anything longer
+(`truncation="rand_trunc"`), which is what originally collapsed every track to a
+dice-roll — windowing is what fixes it, not a different pooling.
 
 ## Analyzer pipeline (Navidrome-sourced, in-memory)
 
@@ -72,29 +82,65 @@ CREATE VIRTUAL TABLE track_vec USING vec0(track_id PK, embedding FLOAT[512] cosi
    with automatic backfill after the feature extractor changes.
 3. **Download the original** via the `download` endpoint (never `stream` — that may
    transcode and would poison the embeddings), decode in memory, then discard the bytes.
-4. CLAP audio embedding (GPU) + CLAP zero-shot mood scores + librosa descriptors:
-   tempo/energy/brightness, rhythmic irregularity, timbral complexity, dynamic
-   contrast, harmonic instability, percussive balance, flatness, and zero-crossing
-   rate. Robust median/MAD distance across the derived dimensions becomes a
+4. Tile the waveform into 10 s windows at a 5 s hop (a tail ≥ 3 s gets one final
+   end-aligned window). Per window: CLAP audio embedding (GPU, batched across
+   songs) + CLAP zero-shot mood scores. Per track: the centroid embedding, the
+   mean/min/max of each mood score, and librosa descriptors — tempo/energy/
+   brightness, rhythmic irregularity, timbral complexity, dynamic contrast,
+   harmonic instability, percussive balance, flatness, and zero-crossing rate.
+   Robust median/MAD distance across the derived dimensions becomes a
    corpus-relative novelty percentile.
-5. Upsert tracks + features + embedding keyed by `navidrome_id`.
+5. Upsert tracks + features + centroid + segments keyed by `navidrome_id`.
+6. `tags.retag`: every segment whose `tag_version` is stale is scored against a
+   fixed vocabulary (genre / mood / sound / feel) by within-group softmax over CLAP
+   similarities, from the stored embedding — a vocabulary change never re-downloads
+   audio.
 
 ## Query path (orchestrator)
 
 ```
 chat msg → Ollama (search_tracks tool) → parse/validate → executeSearch:
-  semantic_text → CLAP text-encode (embed-server) → KNN over track_vec
+  semantic_text → CLAP text-encode (embed-server) → KNN over segment_vec
   seed_artists  → independent per-artist centroids → one KNN neighborhood each
+  each KNN collapses segments to tracks by best passage (min distance)
   fuse by best seed rank, with semantic rank as a secondary signal
   apply scalar filters; missing seed artists fall back to semantic + are reported
   softly rerank for requested novelty/rhythm/timbre/dynamics/harmony preferences
-  over-fetch candidates → apply focused/balanced/wide per-artist cap
+  membership gate: top 3×count candidates → track cards → Ollama /v1/systemone
+    (tev1) → keep probability ≥ threshold, retrieval order preserved
+  → apply focused/balanced/wide per-artist cap
 → deterministic grounded result summary (no second LLM call)
 → createPlaylist(name, [navidrome_id...]) straight to Navidrome
 ```
 
 Query text is embedded by the **same** CLAP model as the audio (the embed-server), so
 text and audio share one space.
+
+## Membership decision
+
+CLAP similarity is a candidate generator, not a judge: it cannot read "but no
+screamed vocals" or weigh a track's second half against its first. The gate hands
+that judgement to a **decision model** served by Ollama's `/v1/systemone`
+endpoint — Together AI's `tev1` (4B) by default, with Cloudflare's `clef-flash`
+(9B) and `clef` (27B) as drop-in alternatives; the request shape is the same as
+TypeSafe's hosted Jev. On live probes tev1 was as decisive as clef-flash and
+loads 3.5× faster, which is why it is the default. Decision models return a probability per option from one
+forward pass; they never generate text, so there is nothing to parse and nothing
+to hallucinate.
+
+The model never hears audio. It judges a **track card**: title/artist/album,
+duration, BPM, the mean/min/max of each zero-shot mood score, and a passage
+timeline built by merging consecutive segments that share a top genre tag, each
+with its aggregated mood/sound/feel tags. A batch of cards goes into one `state`
+with one `noul` question per track ("does `track_k` belong on a playlist for
+`playlist_request`?"), so ten candidates cost one forward pass.
+
+Rules: the gate judges at most 3×count candidates once per search (probabilities
+are memoised across adaptive retrieval passes), keeps those at or above the
+threshold (default 0.5), preserves retrieval order rather than reranking by
+probability, and reports `classifier` as the shortfall reason when it is the
+limiter. A failing decision model is an error surfaced to the user, not a silent
+fallback; an empty `MINSTREL_DECISION_MODEL` disables the gate explicitly.
 
 ## Search plan V2: intent, relevance, and cardinality
 
@@ -283,9 +329,18 @@ deterministic executor cannot derive itself.
   Docker Compose for the Spark (Ollama is external).
 - **Verified on the dev Mac:** all tests green (TS + Python); the orchestrator image
   builds, boots, and serves the bundled UI in production.
+- **Built & tested (segment + decision overhaul):** windowed CLAP embeddings with
+  per-segment mood scores and tags, best-passage segment KNN, track cards, and the
+  decision-model membership gate over Ollama `/v1/systemone` — unit-tested on
+  both halves with fakes, and the gate live-verified against tev1 and clef-flash
+  on hand-built cards (correct accept/reject on both a request and its inverse).
 - **Remaining — needs the Spark:**
   1. `docker compose build` — confirm the NGC image tag supports GB10/aarch64
      (`nvcr.io` login may be required) and the deps install atop the image's torch.
   2. Copy `.env.example` → `.env`; fill credentials, `MUSIC_PATH`, `OLLAMA_URL`, model.
-  3. `docker compose up`, then `docker compose run --rm analyzer` to ingest the library.
-  4. Live end-to-end smoke: a typed vibe → a real playlist in Navidrome.
+  3. Ollama ≥ 0.35.0 with `ollama pull tev1` (or `clef-flash`/`clef`; see
+     ollama#18769 if `clef-flash` errors with "non-finite logit" on `/v1/systemone`).
+  4. `docker compose up`, then `docker compose run --rm analyzer` — the feature
+     version bump re-ingests the whole library into segments (~60 windows/track).
+  5. Live end-to-end smoke: a typed vibe → a real playlist in Navidrome; tune
+     `MINSTREL_DECISION_BATCH` and the gate threshold on real decisions.

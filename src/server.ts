@@ -1,5 +1,6 @@
 import index from "../app.html";
 import { openDb } from "./db";
+import { makeDecider } from "./decider";
 import { makeEmbedder } from "./embedder";
 import { makeNavidrome } from "./navidrome";
 import { chatHandler, playlistHandler } from "./handlers";
@@ -7,6 +8,9 @@ import { chatHandler, playlistHandler } from "./handlers";
 const db = openDb(process.env.MINSTREL_DB ?? "minstrel.db");
 const embedText = makeEmbedder();
 const navidrome = makeNavidrome();
+// An empty MINSTREL_DECISION_MODEL disables the membership gate entirely.
+const decide =
+  process.env.MINSTREL_DECISION_MODEL === "" ? undefined : makeDecider();
 
 async function parseJson(req: Request): Promise<unknown> {
   try {
@@ -30,7 +34,7 @@ const server = Bun.serve({
     "/api/chat": {
       POST: async (req) => {
         try {
-          return await chatHandler({ db, embedText }, await parseJson(req));
+          return await chatHandler({ db, embedText, decide }, await parseJson(req));
         } catch (err) {
           return serverError(err);
         }

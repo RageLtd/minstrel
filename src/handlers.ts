@@ -1,5 +1,6 @@
 import type { Database } from "bun:sqlite";
 import { handleMessage } from "./loop";
+import type { DecideMembership } from "./decider";
 import type { EmbedText } from "./embedder";
 import type { NavidromeClient } from "./navidrome";
 import type { chatWithTools } from "./ollama";
@@ -11,15 +12,21 @@ export interface ChatDeps {
   db: Database;
   embedText: EmbedText;
   chat?: typeof chatWithTools;
+  decide?: DecideMembership;
 }
 
-export async function chatHandler(deps: ChatDeps, body: unknown): Promise<Response> {
+export async function chatHandler(deps: ChatDeps, body: unknown) {
   const message = (body as { message?: unknown } | null)?.message;
   if (typeof message !== "string" || !message.trim()) {
     return Response.json({ error: "message required" }, { status: 400 });
   }
   const result = await handleMessage(
-    { db: deps.db, embedText: deps.embedText, chat: deps.chat },
+    {
+      db: deps.db,
+      embedText: deps.embedText,
+      chat: deps.chat,
+      decide: deps.decide,
+    },
     message,
   );
   return Response.json(result);

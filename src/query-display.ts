@@ -92,6 +92,13 @@ export function describeSearchDiagnostics(
       label: "Diversity backfill",
       value: `${diagnostics.diversityBackfilled} tracks`,
     },
+    {
+      label: "Membership decision",
+      value:
+        diagnostics.classifierEvaluated > 0
+          ? `${diagnostics.classifierEvaluated} judged, ${diagnostics.classifierRejected} rejected`
+          : "Not applied",
+    },
   ];
   if (diagnostics.shortfallReason) {
     details.push({ label: "Shortfall reason", value: diagnostics.shortfallReason });
